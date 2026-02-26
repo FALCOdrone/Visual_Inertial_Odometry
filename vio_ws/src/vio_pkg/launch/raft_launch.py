@@ -20,10 +20,11 @@ def generate_launch_description():
     )
 
     # --- Nodes ---
-    frontend_node = Node(
+    # RAFT frontend instead of the original LK frontend
+    frontend_raft_node = Node(
         package="vio_pkg",
-        executable="frontend",
-        name="vio_frontend",
+        executable="frontend_raft",
+        name="vio_frontend_raft",
         output="screen",
     )
 
@@ -33,7 +34,6 @@ def generate_launch_description():
         name="vio_backend",
         output="screen",
     )
-
 
     ground_truth_node = Node(
         package="vio_pkg",
@@ -80,7 +80,7 @@ def generate_launch_description():
         [
             bag_path_arg,
             bag_rate_arg,
-            frontend_node,
+            frontend_raft_node,
             backend_node,
             ground_truth_node,
             comparator_node,

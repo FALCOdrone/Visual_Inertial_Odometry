@@ -53,7 +53,7 @@ class TrajectoryComparator(Node):
             Odometry, "/ground_truth/odom", self.gt_callback, 100
         )
         self.create_subscription(
-            Odometry, "/odom/vio", self.vio_callback, 100
+            Odometry, "/odom/vio_ekf", self.vio_callback, 100
         )
 
         self.samples_written = 0

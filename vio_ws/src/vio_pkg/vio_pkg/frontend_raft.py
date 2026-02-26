@@ -1,7 +1,11 @@
 # =============================================================================
-# VIO Frontend – Stereo visual odometry via feature tracking + PnP
-# Pipeline: detect features → track (LK optical flow) → triangulate (stereo)
+# VIO Frontend (RAFT) – Stereo visual odometry via RAFT optical flow + PnP
+# Pipeline: detect features → track (RAFT dense flow) → triangulate (stereo)
 #           → estimate motion (PnP RANSAC) → publish pose to backend EKF
+#
+# Multi-frame: keeps a sliding window of k previous frames. Tracks are
+# established from ALL buffered frames to the current frame, giving PnP
+# a richer set of 3D-2D correspondences.
 # =============================================================================
 
 import rclpy  # type: ignore
@@ -14,12 +18,37 @@ import cv2  # type: ignore
 import numpy as np  # type: ignore
 from scipy.spatial.transform import Rotation as R  # type: ignore
 import traceback  # type: ignore
+import time  # type: ignore
+from collections import deque
+
+import torch
+import torchvision.transforms.functional as TF
+from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 
 
-class VIOFrontend(Node):
+class VIOFrontendRAFT(Node):
     def __init__(self):
-        super().__init__("vio_frontend")
+        super().__init__("vio_frontend_raft")
         self.bridge = CvBridge()
+
+        # ==================== Device Selection ====================
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            self.get_logger().info("RAFT running on CUDA GPU.")
+        else:
+            self.device = torch.device("cpu")
+            self.get_logger().warn(
+                "RAFT running on CPU – expect ~200 ms/frame. "
+                "Install CUDA for real-time performance."
+            )
+
+        # ==================== RAFT Model ====================
+        weights = Raft_Small_Weights.DEFAULT
+        self.raft_model = raft_small(weights=weights).to(self.device)
+        self.raft_model.eval()
+        # Input transforms recommended by torchvision
+        self.raft_transforms = weights.transforms()
+        self.get_logger().info("RAFT-Small model loaded.")
 
         # ==================== Camera Intrinsics (EuRoC cam0) ====================
         # TUNABLE: Must match the camera calibration of your dataset/sensor.
@@ -35,19 +64,26 @@ class VIOFrontend(Node):
         self.prev_keypoints = None  # previous 2D keypoints (Nx1x2)
         self.prev_pts_3d = None     # previous 3D points   (Nx3)
 
+        # ==================== TUNABLE: Multi-Frame Buffer ====================
+        # K_FRAMES: number of past frames to keep for multi-frame tracking.
+        # More frames → more 3D-2D correspondences for PnP (more robust)
+        # but also more RAFT inference calls per frame (slower).
+        # Recommended range: 3–10.
+        self.K_FRAMES = 5
+        self.frame_buffer = deque(maxlen=self.K_FRAMES)
+
         # ==================== TUNABLE: Feature Detector ====================
         # goodFeaturesToTrack (Shi-Tomasi corners)
         # maxCorners   – max features per frame  (more → denser but slower)
         # qualityLevel – corner quality threshold (lower → more features)
-        # minDistance  – min pixel spacing        (higher → more spread out)
+        # minDistance   – min pixel spacing        (higher → more spread out)
         # blockSize    – neighbourhood size        (larger → smoother response)
         self.feature_params = dict(
             maxCorners=800, qualityLevel=0.01, minDistance=10, blockSize=7
         )
 
-        # ==================== TUNABLE: Optical Flow (Lucas-Kanade) ====================
-        # winSize  – search window (larger → handles bigger motion, noisier)
-        # criteria – iteration stop (count, epsilon)
+        # ==================== TUNABLE: LK params (stereo matching only) ====================
+        # LK is still used for LEFT→RIGHT stereo matching (triangulation).
         self.lk_params = dict(
             winSize=(21, 21),
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
@@ -73,20 +109,12 @@ class VIOFrontend(Node):
         )
         self.ts.registerCallback(self.stereo_callback)
 
-        self.get_logger().info("VIO Frontend Started. Waiting for images...")
+        self.get_logger().info("VIO Frontend (RAFT) Started. Waiting for images...")
 
         self.global_transform = np.eye(4)  # accumulated camera pose (cam frame)
 
         # ==================== Frame Transform: Camera → Body ====================
-        # EXPLANATION OF UNCERTAINTY IN FRAME ORIENTATION:
-        # The VIO pipeline natively operates in the standard ROS FLU body frame:
-        #   X = Forward
-        #   Y = Left
-        #   Z = Up
-        # This matches the native IMU data from the EuRoC ADIS16448 sensor.
-        # The camera on the EuRoC MAV observes the world as: X-right, Y-down, Z-forward.
-        # To rotate camera observations into the native IMU body frame:
-        # Mapping: body_X = cam_Z, body_Y = -cam_X, body_Z = -cam_Y
+        # body_X = cam_Z, body_Y = -cam_X, body_Z = -cam_Y
         self.R_body_cam = np.array([
             [ 0,  0,  1],
             [-1,  0,  0],
@@ -96,10 +124,76 @@ class VIOFrontend(Node):
         self.T_body_cam[:3, :3] = self.R_body_cam
         self.T_body_cam_inv = np.linalg.inv(self.T_body_cam)
 
+    # ======================== RAFT Inference ========================
+    def _run_raft(self, gray_prev, gray_curr):
+        """
+        Run RAFT optical flow from gray_prev to gray_curr.
+        Returns dense flow field as numpy array (H, W, 2).
+        """
+        # RAFT expects 3-channel uint8 tensors [B, 3, H, W]
+        img1_rgb = cv2.cvtColor(gray_prev, cv2.COLOR_GRAY2RGB)
+        img2_rgb = cv2.cvtColor(gray_curr, cv2.COLOR_GRAY2RGB)
+
+        # Convert to tensor [H, W, C] → [C, H, W] → float [0, 1]
+        t1 = torch.from_numpy(img1_rgb).permute(2, 0, 1).float()
+        t2 = torch.from_numpy(img2_rgb).permute(2, 0, 1).float()
+
+        # Apply recommended transforms (normalisation)
+        t1, t2 = self.raft_transforms(t1, t2)
+
+        # Add batch dimension
+        t1 = t1.unsqueeze(0).to(self.device)
+        t2 = t2.unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            # RAFT returns a list of flow predictions (one per iteration);
+            # last element is the most refined.
+            flow_preds = self.raft_model(t1, t2)
+            flow = flow_preds[-1]  # [1, 2, H, W]
+
+        # Convert to numpy (H, W, 2)
+        flow_np = flow[0].permute(1, 2, 0).cpu().numpy()
+        return flow_np
+
+    def _sample_flow_at_keypoints(self, flow, keypoints):
+        """
+        Given a dense flow field (H, W, 2) and keypoints (Nx1x2),
+        sample the flow at each keypoint via bilinear interpolation
+        and return displaced keypoint positions (Nx1x2).
+        """
+        H, W, _ = flow.shape
+        kp = keypoints.reshape(-1, 2).astype(np.float32)
+
+        # Bilinear sampling using cv2.remap
+        map_x = kp[:, 0]
+        map_y = kp[:, 1]
+
+        # Sample flow_x and flow_y channels at keypoint locations
+        flow_x = cv2.remap(
+            flow[:, :, 0].astype(np.float32),
+            map_x.reshape(1, -1),
+            map_y.reshape(1, -1),
+            cv2.INTER_LINEAR,
+        ).flatten()
+        flow_y = cv2.remap(
+            flow[:, :, 1].astype(np.float32),
+            map_x.reshape(1, -1),
+            map_y.reshape(1, -1),
+            cv2.INTER_LINEAR,
+        ).flatten()
+
+        new_kp = np.stack([kp[:, 0] + flow_x, kp[:, 1] + flow_y], axis=-1)
+
+        # Clamp to image bounds
+        new_kp[:, 0] = np.clip(new_kp[:, 0], 0, W - 1)
+        new_kp[:, 1] = np.clip(new_kp[:, 1], 0, H - 1)
+
+        return new_kp.reshape(-1, 1, 2)
+
     # ======================== Pipeline Stage 0: Init ========================
     def _initialize_vo(self, img_l, img_r):
         """First-frame bootstrap: detect features, triangulate stereo 3D points."""
-        self.get_logger().info("Initializing VIO Frontend...")
+        self.get_logger().info("Initializing VIO Frontend (RAFT)...")
         self.prev_gray = img_l
         self.prev_keypoints = self._detect_features(img_l)
 
@@ -118,42 +212,130 @@ class VIOFrontend(Node):
             )
 
         self.prev_keypoints = valid_kp
-        self.get_logger().info("Initialization successful.")
+        self.prev_pts_3d = self.prev_pts_3d
+
+        # Seed the frame buffer with the first frame
+        self.frame_buffer.clear()
+        self.frame_buffer.append({
+            'gray': img_l.copy(),
+            'keypoints': valid_kp.copy(),
+            'pts_3d': self.prev_pts_3d.copy(),
+        })
+
+        self.get_logger().info("Initialization successful (RAFT).")
         return f"Initialized with {len(self.prev_keypoints)} points."
 
-    # ===================== Pipeline Stage 1: Track =====================
+    # ===================== Pipeline Stage 1: Track (RAFT) =====================
     def _track_features(self, current_gray):
-        """LK optical flow with forward-backward consistency check."""
-        # Forward pass: prev → curr
-        p1, st1, _ = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray, current_gray, self.prev_keypoints, None, **self.lk_params
-        )
+        """
+        RAFT-based tracking with forward-backward consistency check.
+        Tracks from ONLY the immediately previous frame (like original LK).
+        Multi-frame tracking is handled separately in the callback.
+        """
+        t0 = time.perf_counter()
 
-        if p1 is None:
-            raise ValueError("Optical Flow failed.")
+        # Forward pass: prev → curr (RAFT)
+        flow_fwd = self._run_raft(self.prev_gray, current_gray)
+        new_kp = self._sample_flow_at_keypoints(flow_fwd, self.prev_keypoints)
 
-        # Backward pass: curr → prev (consistency verification)
-        p0_back, st2, _ = cv2.calcOpticalFlowPyrLK(
-            current_gray, self.prev_gray, p1, None, **self.lk_params
-        )
+        # Backward pass: curr → prev (consistency check)
+        flow_bwd = self._run_raft(current_gray, self.prev_gray)
+        back_kp = self._sample_flow_at_keypoints(flow_bwd, new_kp)
 
         # Round-trip reprojection error
         fb_err = np.linalg.norm(
-            (self.prev_keypoints - p0_back).reshape(-1, 2), axis=1
+            (self.prev_keypoints - back_kp).reshape(-1, 2), axis=1
         )
 
-        # TUNABLE: fb_err < 1.0 px – forward-backward consistency threshold
-        st = (st1.flatten() == 1) & (st2.flatten() == 1) & (fb_err < 1.0)
+        # TUNABLE: fb_err < 2.0 px – forward-backward consistency threshold
+        # Slightly more permissive than LK (1.0) because RAFT sub-pixel
+        # precision may differ between forward and backward at boundaries.
+        st = fb_err < 2.0
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        self.get_logger().info(
+            f"RAFT track: {np.sum(st)}/{len(st)} survived FB check "
+            f"({elapsed:.0f} ms)"
+        )
 
         # TUNABLE: minimum surviving tracks to continue (default 10)
         if np.sum(st) < 10:
             raise ValueError(f"Tracking lost ({np.sum(st)} points after FB check).")
 
-        good_new_2d = p1[st].reshape(-1, 1, 2)
+        good_new_2d = new_kp[st].reshape(-1, 1, 2)
         good_old_2d = self.prev_keypoints[st].reshape(-1, 1, 2)
         good_old_3d = self.prev_pts_3d[st]
 
         return good_new_2d, good_old_2d, good_old_3d
+
+    # ============= Pipeline Stage 1b: Multi-Frame Track (RAFT) =============
+    def _track_from_buffer(self, current_gray):
+        """
+        Track features from ALL buffered frames to the current frame.
+        Merges correspondences to give PnP a richer set of 3D-2D matches.
+        Returns (merged_new_2d, merged_old_3d) after NMS de-duplication.
+        """
+        if len(self.frame_buffer) <= 1:
+            return None, None
+
+        all_new_2d = []
+        all_old_3d = []
+
+        # Track from each buffered frame (skip most recent, handled by _track_features)
+        for i, entry in enumerate(list(self.frame_buffer)[:-1]):
+            buf_gray = entry['gray']
+            buf_kp = entry['keypoints']
+            buf_3d = entry['pts_3d']
+
+            if buf_kp is None or len(buf_kp) == 0:
+                continue
+
+            try:
+                flow_fwd = self._run_raft(buf_gray, current_gray)
+                new_kp = self._sample_flow_at_keypoints(flow_fwd, buf_kp)
+
+                # Quick backward check
+                flow_bwd = self._run_raft(current_gray, buf_gray)
+                back_kp = self._sample_flow_at_keypoints(flow_bwd, new_kp)
+                fb_err = np.linalg.norm(
+                    (buf_kp - back_kp).reshape(-1, 2), axis=1
+                )
+
+                # More permissive for older frames (larger motion)
+                threshold = 2.0 + 0.5 * (len(self.frame_buffer) - 1 - i)
+                st = fb_err < threshold
+
+                if np.sum(st) > 0:
+                    all_new_2d.append(new_kp[st].reshape(-1, 2))
+                    all_old_3d.append(buf_3d[st])
+            except Exception:
+                continue
+
+        if not all_new_2d:
+            return None, None
+
+        merged_2d = np.concatenate(all_new_2d, axis=0)
+        merged_3d = np.concatenate(all_old_3d, axis=0)
+
+        # NMS-style de-duplication: keep only one point per 5px neighbourhood
+        if len(merged_2d) > 0:
+            merged_2d, merged_3d = self._nms_keypoints(merged_2d, merged_3d, radius=5.0)
+
+        return merged_2d.reshape(-1, 1, 2), merged_3d
+
+    def _nms_keypoints(self, kp_2d, pts_3d, radius=5.0):
+        """
+        Non-maximum suppression on 2D keypoints.
+        Keeps the first occurrence; removes later points within `radius` px.
+        """
+        keep = np.ones(len(kp_2d), dtype=bool)
+        for i in range(len(kp_2d)):
+            if not keep[i]:
+                continue
+            dists = np.linalg.norm(kp_2d[i + 1:] - kp_2d[i], axis=1)
+            too_close = np.where(dists < radius)[0] + i + 1
+            keep[too_close] = False
+        return kp_2d[keep], pts_3d[keep]
 
     # ================== Pipeline Stage 2: Motion Estimation ==================
     def _estimate_motion(self, good_old_3d, good_new_2d):
@@ -230,25 +412,52 @@ class VIOFrontend(Node):
                 status_color = (0, 255, 0)
                 raise StopIteration(status_text)
 
-            # --- Stage 1: Track features ---
+            # --- Stage 1: Track features (primary: prev frame) ---
             good_new_2d, good_old_2d, good_old_3d = self._track_features(img_l)
-            rvec, tvec, pnp_new_2d, pnp_old_3d, inlier_count = self._estimate_motion(
-                good_old_3d, good_new_2d
+
+            # --- Stage 1b: Multi-frame augmentation ---
+            # Merge correspondences from older buffered frames for richer PnP
+            buf_new_2d, buf_old_3d = self._track_from_buffer(img_l)
+            if buf_new_2d is not None and len(buf_new_2d) > 0:
+                combined_new_2d = np.concatenate(
+                    [good_new_2d, buf_new_2d], axis=0
+                )
+                combined_old_3d = np.concatenate(
+                    [good_old_3d, buf_old_3d], axis=0
+                )
+                self.get_logger().info(
+                    f"Multi-frame: +{len(buf_new_2d)} correspondences "
+                    f"(total {len(combined_new_2d)})"
+                )
+            else:
+                combined_new_2d = good_new_2d
+                combined_old_3d = good_old_3d
+
+            # --- Stage 2: Motion estimation (PnP) ---
+            rvec, tvec, pnp_new_2d, pnp_old_3d, inlier_count = (
+                self._estimate_motion(combined_old_3d, combined_new_2d)
             )
 
             # --- Publish pose to backend EKF ---
             self.publish_visual_odom(rvec, tvec, left_msg.header, inlier_count)
 
             # --- Stage 3: Propagate 3D points & replenish features ---
+            # Use only the primary-frame tracked points for state propagation
             R_mat, _ = cv2.Rodrigues(rvec)
-            fallback_3d = (R_mat @ pnp_old_3d.T + tvec).T  # transform old 3D → current frame
+            primary_pnp_mask = np.arange(len(good_new_2d))
+            # Filter to only primary-frame inliers for propagation
+            primary_new_2d = good_new_2d
+            primary_old_3d = good_old_3d
+            fallback_3d = (R_mat @ primary_old_3d.T + tvec).T
 
-            num_tracked_features = len(pnp_new_2d)
-            new_features_kp = self._maintain_features(img_l, pnp_new_2d)
+            num_tracked_features = len(primary_new_2d)
+            new_features_kp = self._maintain_features(img_l, primary_new_2d)
 
-            current_kp = pnp_new_2d
+            current_kp = primary_new_2d
             if new_features_kp is not None and len(new_features_kp) > 0:
-                current_kp = np.concatenate((pnp_new_2d, new_features_kp), axis=0)
+                current_kp = np.concatenate(
+                    (primary_new_2d, new_features_kp), axis=0
+                )
                 nan_padding = np.full(
                     (len(new_features_kp), 3), np.nan, dtype=np.float32
                 )
@@ -269,7 +478,18 @@ class VIOFrontend(Node):
             self.prev_keypoints = valid_kp
             self.prev_pts_3d = next_pts_3d
             self.prev_gray = img_l
-            status_text = f"Inliers: {inlier_count} | Tracked: {len(valid_kp)}"
+
+            # --- Push frame into multi-frame buffer ---
+            self.frame_buffer.append({
+                'gray': img_l.copy(),
+                'keypoints': valid_kp.copy(),
+                'pts_3d': next_pts_3d.copy(),
+            })
+
+            status_text = (
+                f"Inliers: {inlier_count} | Tracked: {len(valid_kp)} | "
+                f"Buffer: {len(self.frame_buffer)}"
+            )
             status_color = (0, 255, 0)
 
             # ---- Visualization: tracked keypoints (green lines + red dots) ----
@@ -277,16 +497,23 @@ class VIOFrontend(Node):
                 a, b = new.ravel()
                 c, d = old.ravel()
                 cv2.line(vis_img, (int(a), int(b)), (int(c), int(d)), (0, 255, 0), 2)
-                cv2.circle(
-                    vis_img, (int(a), int(b)), 3, (0, 0, 255), -1
-                )  # Restored red dots
+                cv2.circle(vis_img, (int(a), int(b)), 3, (0, 0, 255), -1)
+
+            # Draw multi-frame matches in cyan
+            if buf_new_2d is not None:
+                for pt in buf_new_2d:
+                    x, y = pt.ravel()
+                    cv2.circle(
+                        vis_img, (int(x), int(y)), 4, (255, 255, 0), 1
+                    )
+
             self.tracked_keypoints_pub.publish(
                 self.bridge.cv2_to_imgmsg(vis_img, "bgr8", header=left_msg.header)
             )
 
             # ---- Visualization: feature count (green=tracked, blue=new) ----
             vis_feature_img = cv2.cvtColor(img_l, cv2.COLOR_GRAY2BGR)
-            for pt in pnp_new_2d:
+            for pt in primary_new_2d:
                 cv2.circle(
                     vis_feature_img,
                     (int(pt.ravel()[0]), int(pt.ravel()[1])),
@@ -296,7 +523,6 @@ class VIOFrontend(Node):
                 )
             if new_features_kp is not None:
                 for pt in new_features_kp:
-                    # Blue dots for new features
                     cv2.circle(
                         vis_feature_img,
                         (int(pt.ravel()[0]), int(pt.ravel()[1])),
@@ -328,12 +554,14 @@ class VIOFrontend(Node):
             status_text = str(e)
             self.get_logger().warn(status_text)
             self.prev_gray = None
+            self.frame_buffer.clear()
         except Exception as e:
             status_text = f"Error: {e}"
             self.get_logger().error(
                 f"Error in processing: {e}\n{traceback.format_exc()}"
             )
             self.prev_gray = None
+            self.frame_buffer.clear()
 
         # ---- Debug window overlay ----
         if vis_img is not None:
@@ -346,7 +574,7 @@ class VIOFrontend(Node):
                 status_color,
                 2,
             )
-            cv2.imshow("VIO Frontend", vis_img)
+            cv2.imshow("VIO Frontend (RAFT)", vis_img)
             cv2.waitKey(1)
 
     # ==================== Utility: Feature Detection ====================
@@ -364,7 +592,7 @@ class VIOFrontend(Node):
             return None, np.zeros((0, 3))
 
         kp_l = kp_l.astype(np.float32)
-        # Match left keypoints in right image via optical flow
+        # Match left keypoints in right image via LK optical flow (stereo only)
         kp_r, st, _ = cv2.calcOpticalFlowPyrLK(
             img_l, img_r, kp_l, None, **self.lk_params
         )
@@ -447,8 +675,8 @@ class VIOFrontend(Node):
         # More inliers → lower variance → backend EKF trusts VO more.
         # TUNABLE: 0.1 scaling factor, floor (0.0001), cap (0.5)
         variance_val = 1.0 / (inlier_count + 1) * 0.1
-        variance_val = max(variance_val, 0.0001)  # floor – prevent near-zero variance
-        variance_val = min(variance_val, 0.5)      # cap   – prevent runaway distrust
+        variance_val = max(variance_val, 0.0001)  # floor
+        variance_val = min(variance_val, 0.5)      # cap
 
         # Position covariance diagonal (x, y, z)
         msg.pose.covariance[0] = variance_val
@@ -466,7 +694,7 @@ class VIOFrontend(Node):
 # ========================== Entry Point ==========================
 def main(args=None):
     rclpy.init(args=args)
-    node = VIOFrontend()
+    node = VIOFrontendRAFT()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

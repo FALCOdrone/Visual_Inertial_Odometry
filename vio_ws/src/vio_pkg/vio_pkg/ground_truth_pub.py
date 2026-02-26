@@ -27,7 +27,8 @@ class GroundTruthPublisher(Node):
         self.path_msg.header.frame_id = "odom"
 
         # Store first pose as origin for calibration
-        self.origin_T = None  # 4x4 transform of first Vicon reading
+        self.origin_pos = None  # position of first Vicon reading
+        self.origin_rot_inv = None  # inverse rotation of first Vicon reading
 
         self.get_logger().info("Ground Truth Publisher Started.")
 
@@ -35,22 +36,23 @@ class GroundTruthPublisher(Node):
         t = msg.transform.translation
         r = msg.transform.rotation
 
-        # Build 4x4 transform from Vicon reading
-        T_cur = np.eye(4)
-        T_cur[:3, :3] = R.from_quat([r.x, r.y, r.z, r.w]).as_matrix()
-        T_cur[:3, 3] = [t.x, t.y, t.z]
-
-        # Calibrate: store first pose and subtract from all
-        if self.origin_T is None:
-            self.origin_T = T_cur.copy()
+        # Store first pose (position + orientation) as origin
+        if self.origin_pos is None:
+            self.origin_pos = np.array([t.x, t.y, t.z])
+            self.origin_rot_inv = R.from_quat(
+                [r.x, r.y, r.z, r.w]
+            ).inv()
             self.get_logger().info(
                 f"Ground truth origin set: [{t.x:.2f}, {t.y:.2f}, {t.z:.2f}]"
             )
 
-        # T_calibrated = T_origin_inv @ T_cur
-        T_cal = np.linalg.inv(self.origin_T) @ T_cur
-        pos = T_cal[:3, 3]
-        quat = R.from_matrix(T_cal[:3, :3]).as_quat()
+        # Express position in the initial body frame so it matches the EKF frame
+        pos_world = np.array([t.x, t.y, t.z]) - self.origin_pos
+        pos = self.origin_rot_inv.apply(pos_world)
+
+        # Relative orientation w.r.t. initial pose
+        quat_current = R.from_quat([r.x, r.y, r.z, r.w])
+        q_rel = (self.origin_rot_inv * quat_current).as_quat()  # x,y,z,w
 
         # --- Publish as Odometry ---
         odom = Odometry()
@@ -62,10 +64,10 @@ class GroundTruthPublisher(Node):
         odom.pose.pose.position.y = float(pos[1])
         odom.pose.pose.position.z = float(pos[2])
 
-        odom.pose.pose.orientation.x = float(quat[0])
-        odom.pose.pose.orientation.y = float(quat[1])
-        odom.pose.pose.orientation.z = float(quat[2])
-        odom.pose.pose.orientation.w = float(quat[3])
+        odom.pose.pose.orientation.x = float(q_rel[0])
+        odom.pose.pose.orientation.y = float(q_rel[1])
+        odom.pose.pose.orientation.z = float(q_rel[2])
+        odom.pose.pose.orientation.w = float(q_rel[3])
 
         self.odom_pub.publish(odom)
 

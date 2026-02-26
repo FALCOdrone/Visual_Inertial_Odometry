@@ -20,9 +20,18 @@ class VIOBackend(Node):
         self.bg = np.zeros(3) # Gyro bias
         self.ba = np.zeros(3) # Accel bias
         
-        # Covariance Matrix P
-        self.P = np.eye(15) * 0.01
-        self.P[9:15, 9:15] *= 0.01 
+        # ===================== TUNABLE: Initial Covariance P =====================
+        # P encodes initial uncertainty in each error-state component.
+        #   Rows/cols  0-2  : position  (m)
+        #   Rows/cols  3-5  : velocity  (m/s)
+        #   Rows/cols  6-8  : orientation / angle error (rad)
+        #   Rows/cols  9-11 : gyro bias  (rad/s)
+        #   Rows/cols 12-14 : accel bias (m/s²)
+        # Larger values → EKF trusts measurements more at start.
+        # Smaller values → EKF trusts IMU prediction more at start.
+        # Typical range: 1e-4 … 1.0 for pos/vel/angle, 1e-6 … 1e-3 for biases.
+        self.P = np.eye(15) * 0.01       # default uncertainty for pos, vel, angle
+        self.P[9:15, 9:15] *= 0.01       # tighter prior on biases (1e-4)
 
         # Constants
         self.g = np.array([0.0, 0.0, -9.81])
@@ -32,18 +41,26 @@ class VIOBackend(Node):
         self.initialized = False
         self.init_accel_samples = []
         self.init_gyro_samples = []
-        self.INIT_SAMPLE_COUNT = 50  # ~0.25s at 200Hz
+        # TUNABLE: Number of stationary IMU samples for gravity alignment.
+        # More samples → better initial orientation but longer startup delay.
+        # Typical range: 30–200.  At 200 Hz: 50 samples ≈ 0.25 s.
+        self.INIT_SAMPLE_COUNT = 50
 
         # --- ROS Communication ---
-        self.odom_pub = self.create_publisher(Odometry, '/odom/vio', 10)
-        self.path_pub = self.create_publisher(Path, '/odom/vio/path', 10)
+        self.odom_pub = self.create_publisher(Odometry, '/odom/vio_ekf', 10)
+        self.path_pub = self.create_publisher(Path, '/odom/vio_ekf/path', 10)
         self.path_msg = Path()
         self.path_msg.header.frame_id = "odom"
-        self.create_subscription(Imu, '/imu0', self.imu_callback, 100)
-        self.create_subscription(PoseWithCovarianceStamped, '/vio/visual_odom', self.vo_callback, 10)
-        self.create_subscription(PoseWithCovarianceStamped, '/vio/loop_correction', self.loop_correction_callback, 10)
 
-        self.get_logger().info("VIO Backend Started with Dynamic Covariance + Loop Closure Support...")
+        self.imu_odom_pub = self.create_publisher(Odometry, '/odom/imu', 10)
+        self.imu_path_pub = self.create_publisher(Path, '/odom/imu/path', 10)
+        self.imu_path_msg = Path()
+        self.imu_path_msg.header.frame_id = "odom"
+
+        self.create_subscription(Imu, '/fcu/imu', self.imu_callback, 100)
+        self.create_subscription(PoseWithCovarianceStamped, '/vio/visual_odom', self.vo_callback, 10)
+
+        self.get_logger().info("VIO Backend Started with Dynamic Covariance...")
 
     def skew_symmetric(self, v):
         """Creates a skew-symmetric matrix from a 3-element vector."""
@@ -151,21 +168,43 @@ class VIOBackend(Node):
         F[6:9, 6:9] = np.eye(3) - self.skew_symmetric(gyro) * dt
         F[6:9, 9:12] = -np.eye(3) * dt # Angle w.r.t Gyro Bias
 
-        # Process Noise Q
+        # ===================== TUNABLE: Process Noise Q =====================
+        # These parameters model how much the IMU readings can be "off".
+        # Increasing a noise value → EKF trusts IMU less → relies more on VO.
+        # Decreasing a noise value → EKF trusts IMU more → smoother but may drift.
         Q = np.zeros((15, 15))
-        noise_acc = 0.05
-        noise_gyro = 0.01
+
+        # Accelerometer noise spectral density (m/s²).
+        # Increase if position/velocity drifts quickly without VO corrections.
+        # Typical range: 0.01 – 0.5 (datasheet: ~0.01, practical: 0.03–0.1)
+        noise_acc = 0.3
+
+        # Gyroscope noise spectral density (rad/s).
+        # Increase if orientation drifts or oscillates.
+        # Typical range: 0.001 – 0.1 (datasheet: ~0.005, practical: 0.005–0.02)
+        noise_gyro = 0.1
+
+        # Accelerometer bias random-walk (m/s³).
+        # Governs how fast accel bias is allowed to change.
+        # Increase if temperature changes or vibrations cause bias shifts.
+        # Typical range: 1e-4 – 5e-3
         noise_ba_walk = 0.0005
+
+        # Gyroscope bias random-walk (rad/s²).
+        # Governs how fast gyro bias is allowed to change.
+        # Increase if heading slowly drifts despite corrections.
+        # Typical range: 1e-5 – 5e-4
         noise_bg_walk = 0.00005
         
-        Q[3:6, 3:6] = np.eye(3) * noise_acc**2 * dt**2
-        Q[6:9, 6:9] = np.eye(3) * noise_gyro**2 * dt**2
-        Q[9:12, 9:12] = np.eye(3) * noise_bg_walk**2 * dt
-        Q[12:15, 12:15] = np.eye(3) * noise_ba_walk**2 * dt
+        Q[3:6, 3:6] = np.eye(3) * noise_acc**2 * dt**2       # velocity noise
+        Q[6:9, 6:9] = np.eye(3) * noise_gyro**2 * dt**2      # orientation noise
+        Q[9:12, 9:12] = np.eye(3) * noise_bg_walk**2 * dt     # gyro bias drift
+        Q[12:15, 12:15] = np.eye(3) * noise_ba_walk**2 * dt   # accel bias drift
         
         self.P = F @ self.P @ F.T + Q
         self.P = 0.5 * (self.P + self.P.T)  # Enforce symmetry
 
+        self.publish_imu_odometry(msg.header)
         self.publish_odometry(msg.header)
 
     def vo_callback(self, msg):
@@ -191,8 +230,12 @@ class VIOBackend(Node):
         if cov_x > 0:
             R_cov = np.diag([cov_x, cov_y, cov_z])
         else:
-            # Fallback if frontend sends zeros
-            R_cov = np.eye(3) * 0.1
+            # TUNABLE: Fallback VO measurement noise when frontend sends zero covariance.
+            # This is the observation noise R for the position update.
+            # Larger  → EKF trusts VO less  → smoother but slower corrections.
+            # Smaller → EKF trusts VO more  → snappier but noisier trajectory.
+            # Typical range: 0.01 – 1.0
+            R_cov = np.eye(3) * 0.05
 
         # H Matrix (Measurement maps to state)
         H = np.zeros((3, 15))
@@ -228,82 +271,25 @@ class VIOBackend(Node):
         self.P = IKH @ self.P @ IKH.T + K @ R_cov @ K.T
         self.P = 0.5 * (self.P + self.P.T)  # Enforce symmetry
 
-    def loop_correction_callback(self, msg):
-        """Apply pose correction from loop closure using EKF-style blended update."""
-        corrected_pos = np.array([
-            msg.pose.pose.position.x,
-            msg.pose.pose.position.y,
-            msg.pose.pose.position.z,
-        ])
-        corrected_quat = np.array([
-            msg.pose.pose.orientation.x,
-            msg.pose.pose.orientation.y,
-            msg.pose.pose.orientation.z,
-            msg.pose.pose.orientation.w,
-        ])
 
-        # Use loop closure covariance from message
-        lc_cov_pos = np.diag([
-            msg.pose.covariance[0],
-            msg.pose.covariance[7],
-            msg.pose.covariance[14],
-        ])
-        lc_cov_pos = np.maximum(lc_cov_pos, np.eye(3) * 0.001)  # Floor
 
-        # --- Position Update via EKF ---
-        H_pos = np.zeros((3, 15))
-        H_pos[0:3, 0:3] = np.eye(3)
 
-        pos_error = corrected_pos - self.state[0:3]
-        S = H_pos @ self.P @ H_pos.T + lc_cov_pos
-        try:
-            K = self.P @ H_pos.T @ np.linalg.inv(S)
-        except np.linalg.LinAlgError:
-            self.get_logger().error("Singular matrix in loop correction. Skipping.")
-            return
-
-        delta_x = K @ pos_error
-        self.state[0:3] += delta_x[0:3]
-        self.state[3:6] += delta_x[3:6]
-
-        # Orientation correction
-        delta_theta = delta_x[6:9]
-        delta_q = R.from_rotvec(delta_theta)
-        self.quat = (R.from_quat(self.quat) * delta_q).as_quat()
-        self.quat = self.quat / np.linalg.norm(self.quat)
-
-        # Bias corrections
-        self.bg += delta_x[9:12]
-        self.ba += delta_x[12:15]
-
-        # Update covariance (Joseph form)
-        IKH = np.eye(15) - K @ H_pos
-        self.P = IKH @ self.P @ IKH.T + K @ lc_cov_pos @ K.T
-        self.P = 0.5 * (self.P + self.P.T)
-
-        pos_jump = np.linalg.norm(pos_error)
-        self.get_logger().info(
-            f"Loop correction blended: position adjustment = {pos_jump:.3f}m"
-        )
-
-    def publish_odometry(self, header):
+    def _build_odom_msg(self, header):
+        """Build an Odometry message from current EKF state."""
         odom = Odometry()
         odom.header.stamp = header.stamp
         odom.header.frame_id = "odom"
         odom.child_frame_id = "base_link"
         
-        # Transform from body frame to world frame (Z-up) for RViz display
-        pos_world = self.R_init @ self.state[0:3]
-        q_world = (R.from_matrix(self.R_init) * R.from_quat(self.quat)).as_quat()
-
-        odom.pose.pose.position.x = float(pos_world[0])
-        odom.pose.pose.position.y = float(pos_world[1])
-        odom.pose.pose.position.z = float(pos_world[2])
+        # Publish in initial body frame (matches ground truth frame)
+        odom.pose.pose.position.x = float(self.state[0])
+        odom.pose.pose.position.y = float(self.state[1])
+        odom.pose.pose.position.z = float(self.state[2])
         
-        odom.pose.pose.orientation.x = float(q_world[0])
-        odom.pose.pose.orientation.y = float(q_world[1])
-        odom.pose.pose.orientation.z = float(q_world[2])
-        odom.pose.pose.orientation.w = float(q_world[3])
+        odom.pose.pose.orientation.x = float(self.quat[0])
+        odom.pose.pose.orientation.y = float(self.quat[1])
+        odom.pose.pose.orientation.z = float(self.quat[2])
+        odom.pose.pose.orientation.w = float(self.quat[3])
 
         pose_cov = np.zeros((6, 6))
         pose_cov[0:3, 0:3] = self.P[0:3, 0:3] 
@@ -311,7 +297,25 @@ class VIOBackend(Node):
         pose_cov[3:6, 0:3] = self.P[6:9, 0:3] 
         pose_cov[3:6, 3:6] = self.P[6:9, 6:9] 
         odom.pose.covariance = pose_cov.flatten().tolist()
-        
+        return odom
+
+    def publish_imu_odometry(self, header):
+        """Publish IMU-rate odometry on /odom/imu."""
+        odom = self._build_odom_msg(header)
+        self.imu_odom_pub.publish(odom)
+
+        # --- Append to IMU Path ---
+        pose_stamped = PoseStamped()
+        pose_stamped.header = odom.header
+        pose_stamped.pose = odom.pose.pose
+        self.imu_path_msg.header.stamp = header.stamp
+        self.imu_path_msg.poses.append(pose_stamped)
+        if len(self.imu_path_msg.poses) > 5000:
+            self.imu_path_msg.poses = self.imu_path_msg.poses[-5000:]
+        self.imu_path_pub.publish(self.imu_path_msg)
+
+    def publish_odometry(self, header):
+        odom = self._build_odom_msg(header)
         self.odom_pub.publish(odom)
 
         # --- Append to VIO Path ---

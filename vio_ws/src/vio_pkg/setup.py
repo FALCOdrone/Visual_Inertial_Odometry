@@ -24,10 +24,10 @@ setup(
         "console_scripts": [
             "backend = vio_pkg.backend:main",
             "frontend = vio_pkg.frontend:main",
-            "mapper = vio_pkg.mapper:main",
-            "loop_closure = vio_pkg.loop_closure:main",
+            "frontend_raft = vio_pkg.frontend_raft:main",
             "ground_truth_pub = vio_pkg.ground_truth_pub:main",
             "trajectory_comparator = vio_pkg.trajectory_comparator:main",
+            "tf_broadcaster = vio_pkg.tf_broadcaster:main",
         ],
     },
 )
