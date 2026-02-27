@@ -386,8 +386,8 @@ VIO_new/
 | OS | Ubuntu 22.04 | Ubuntu 22.04 / 24.04 |
 | ROS 2 | Humble | Jazzy |
 | Python | 3.10 | 3.11 |
-| GPU | — (CPU fallback) | NVIDIA RTX 3060+ (CUDA 12.x) |
-| RAM | 8 GB | 16 GB |
+| GPU | — (CPU fallback) | 2GB+ VRAM |
+
 
 ### 1. Install ROS 2
 
