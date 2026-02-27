@@ -1,9 +1,66 @@
-easy1/
-hard1/
-med1/
-venv/
-vicon_room1/
-vio_ws/build/
-vio_ws/install/
-vio_ws/log/
+# ── ROS 2 workspace build artifacts ──────────────────────────────────────────
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
 
+# ── Dataset and bag files (too large for git) ─────────────────────────────────
+dataset/
+bags/
+*.db3
+*.mcap
+*.bag
+*.bag.active
+metadata.yaml
+
+# ── PyTorch model weights (downloaded at runtime by LightGlue) ───────────────
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.idea/
+*.swp
+*.swo
+*~
+
+# Keep VSCode workspace settings that are useful to share,
+# but ignore user-specific and generated files:
+.vscode
+.vscode/launch.json
+.vscode/tasks.json
+!.vscode/extensions.json
+
+# ── OS generated ──────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# ── Logs and profiling ────────────────────────────────────────────────────────
+*.log
+*.prof
