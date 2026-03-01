@@ -99,8 +99,15 @@ class PoseEstimationNode(Node):
         self.get_logger().info("PoseEstimationNode initialized")
 
     def load_config(self, config_path):
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        try:
+            with open(config_path, "r") as f:
+                config = yaml.safe_load(f)
+        except Exception as exc:
+            self.get_logger().fatal(
+                f"Failed to load config '{config_path}': {exc}. "
+                "Pass config_path:=<path> or ensure the package is built."
+            )
+            raise
         self.config = config
         self.get_logger().info("Config loaded successfully")
 

@@ -64,3 +64,6 @@ ehthumbs.db
 # ── Logs and profiling ────────────────────────────────────────────────────────
 *.log
 *.prof
+
+# Temp files
+tmp/

@@ -20,6 +20,11 @@ import os
 def generate_launch_description():
     pkg_share = get_package_share_directory("vio_pipeline")
     default_config = os.path.join(pkg_share, "config", "euroc_params.yaml")
+    output_dir = os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "..", "..", "..", "tmp"
+        )
+    )
 
     return LaunchDescription(
         [
@@ -46,6 +51,24 @@ def generate_launch_description():
                     }
                 ],
             ),
+            # IMU Processing Node
+            Node(
+                package="vio_pipeline",
+                executable="imu_processing_node",
+                name="imu_processing_node",
+                output="screen",
+                parameters=[
+                    {
+                        "config_path": LaunchConfiguration("config_file"),
+                        "use_sim_time": LaunchConfiguration("use_sim_time"),
+                        "imu_topic": "/imu0",
+                        "init_duration": 5.0,
+                        "gyro_lpf_cutoff": 15.0,
+                        "accel_lpf_cutoff": 10.0,
+                        "imu_rate_hz": 200,
+                    }
+                ],
+            ),
             # Ground Truth Publisher
             Node(
                 package="vio_pipeline",
@@ -56,6 +79,34 @@ def generate_launch_description():
                     {
                         "config_path": LaunchConfiguration("config_file"),
                         "use_sim_time": LaunchConfiguration("use_sim_time"),
+                    }
+                ],
+            ),
+            # ESKF Node
+            Node(
+                package="vio_pipeline",
+                executable="eskf_node",
+                name="eskf_node",
+                output="screen",
+                parameters=[
+                    {
+                        "config_path": LaunchConfiguration("config_file"),
+                        "use_sim_time": LaunchConfiguration("use_sim_time"),
+                        "meas_pos_std": 0.05,
+                        "meas_ang_std": 0.02,
+                    }
+                ],
+            ),
+            # Debug Logger
+            Node(
+                package="vio_pipeline",
+                executable="debug_logger_node",
+                name="debug_logger_node",
+                output="screen",
+                parameters=[
+                    {
+                        "use_sim_time": LaunchConfiguration("use_sim_time"),
+                        "output_dir": output_dir,
                     }
                 ],
             ),
