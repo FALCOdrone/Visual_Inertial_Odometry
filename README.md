@@ -1,190 +1,155 @@
-# Stereo Visual Odometry Pipeline (VIO — vision-only stage)
+# Visual-Inertial Odometry Pipeline (KLT branch)
 
-A ROS 2 stereo visual-odometry system for the [EuRoC MAV dataset](https://www.research-collection.ethz.ch/entities/researchdata/bcaf173e-5dac-484b-bc37-faf97a594f1f).
-Feature extraction uses **SuperPoint + LightGlue** with a 4-way circular consistency check;
-pose estimation uses stereo triangulation followed by PnP-RANSAC.
+A ROS 2 stereo visual-inertial odometry system for the [EuRoC MAV dataset](https://www.research-collection.ethz.ch/entities/researchdata/bcaf173e-5dac-484b-bc37-faf97a594f1f).
+Feature tracking uses **Shi-Tomasi corners + KLT optical flow** with a forward-backward
+circular consistency check; pose estimation uses stereo triangulation followed by PnP-RANSAC;
+IMU fusion is performed by an **Error-State Kalman Filter (ESKF)**.
 
-> **Status:** Vision-only. IMU fusion (Error-State Kalman Filter) is planned as future work.
+> **Branch:** `KLT` — classical feature tracker, no deep-learning dependencies.
+> The `main` branch uses SuperPoint + LightGlue.
 
 ---
 
 ## Table of Contents
 
 1. [Architecture overview](#1-architecture-overview)
-2. [Feature extraction — SuperPoint + LightGlue](#2-feature-extraction--superpoint--lightglue)
-3. [4-way circular consistency check](#3-4-way-circular-consistency-check)
+2. [Feature tracking — Shi-Tomasi + KLT](#2-feature-tracking--shi-tomasi--klt)
+3. [Forward-backward circular consistency check](#3-forward-backward-circular-consistency-check)
 4. [Stereo triangulation](#4-stereo-triangulation)
 5. [Pose estimation — PnP-RANSAC](#5-pose-estimation--pnp-ransac)
-6. [Coordinate frames](#6-coordinate-frames)
-7. [Project structure](#7-project-structure)
-8. [Requirements and installation](#8-requirements-and-installation)
-9. [Running the pipeline](#9-running-the-pipeline)
-10. [ROS 2 topics and parameters](#10-ros-2-topics-and-parameters)
-11. [Configuration file](#11-configuration-file)
-12. [Future work — IMU fusion with ESKF](#12-future-work--imu-fusion-with-eskf)
+6. [IMU processing](#6-imu-processing)
+7. [Error-State Kalman Filter (ESKF)](#7-error-state-kalman-filter-eskf)
+8. [Coordinate frames](#8-coordinate-frames)
+9. [Project structure](#9-project-structure)
+10. [Requirements and installation](#10-requirements-and-installation)
+11. [Running the pipeline](#11-running-the-pipeline)
+12. [ROS 2 topics and parameters](#12-ros-2-topics-and-parameters)
+13. [Configuration file](#13-configuration-file)
 
 ---
 
 ## 1. Architecture overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         EuRoC MAV Bag                                   │
-│   /cam0/image_raw (20 Hz)       /cam1/image_raw (20 Hz)                 │
-└────────────────┬──────────────────────────┬────────────────────────────┘
-                 │  ApproximateTimeSynchronizer
-                 ▼                          ▼
-       ┌─────────────────────────────────────────────┐
-       │           PoseEstimationNode                │
-       │                                             │
-       │  SuperPoint ──► LightGlue                   │
-       │    stereo match     temporal match          │
-       │          └──────────────────┘               │
-       │          4-way circular check               │
-       │                  │                          │
-       │     circular_tracks (verified)              │
-       │          │                                  │
-       │   undistort keypoints                       │
-       │          │                                  │
-       │   triangulate 3D (prev stereo pair)         │
-       │          │                                  │
-       │   PnP-RANSAC + iterative refinement         │
-       │          │                                  │
-       │   motion sanity check                       │
-       │          │                                  │
-       │   T_world_cam0 ◄── accumulate               │
-       │          │                                  │
-       │   T_world_body = T_world_cam0 @ inv(T_b_c0) │
-       └──────────┬──────────────────────────────────┘
-                  │
-        ┌─────────┼───────────────────┐
-        ▼         ▼                   ▼
-  /vio/pose  /vio/path        /vio/odometry
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            EuRoC MAV Bag                                     │
+│  /cam0/image_raw (20 Hz)   /cam1/image_raw (20 Hz)   /imu0 (200 Hz)         │
+└──────┬──────────────────────────┬──────────────────────┬─────────────────────┘
+       │  ApproximateTimeSynchronizer                     │
+       ▼                          ▼                       ▼
+┌──────────────────────────────────────┐    ┌────────────────────────┐
+│         PoseEstimationNode           │    │   ImuProcessingNode    │
+│                                      │    │                        │
+│  Shi-Tomasi detect                   │    │  static bias init      │
+│       │                              │    │  2nd-order Butterworth │
+│  KLT temporal tracking (L→L)         │    │  LPF (gyro + accel)    │
+│  + forward-backward consistency      │    │  dead-reckoning        │
+│       │                              │    │  integrate             │
+│  KLT stereo matching (L→R)           │    └────────┬───────────────┘
+│  + forward-backward consistency      │             │ /imu/processed (200 Hz)
+│       │                              │             │ /imu/odometry
+│  circular_tracks (verified)          │             │ /imu/pose
+│       │                              │             │ /imu/rpy
+│  undistort keypoints                 │             │
+│       │                              │             ▼
+│  triangulate 3D (prev stereo pair)   │    ┌────────────────────────┐
+│       │                              │    │      EskfNode          │
+│  PnP-RANSAC + iterative refinement   │    │                        │
+│       │                              │    │  IMU prediction 200 Hz │
+│  motion sanity check                 │    │  VIO update    20 Hz   │
+│       │                              │    │  Joseph-form update    │
+│  T_world_cam0 ◄── accumulate         │    │  bias estimation       │
+│       │                              │    └────────┬───────────────┘
+│  T_world_body = T_world_cam0         │             │ /eskf/odometry
+│              @ inv(T_b_c0)           │             │ /eskf/pose
+└──────┬───────────────────────────────┘             │ /eskf/rpy
+       │
+   /vio/pose  /vio/path  /vio/odometry  /vio/rpy
 
-       ┌──────────────────────────────┐
-       │   GroundTruthPublisherNode   │  ← /vicon0/pose (or similar)
-       │  align to initial body frame │
-       └──────────┬───────────────────┘
-                  │
-        /gt_pub/pose   /gt_pub/path   /gt_pub/odometry
+┌──────────────────────────────────┐
+│   GroundTruthPublisherNode       │  ← /gt/pose (Vicon)
+│   align to initial body frame    │
+└──────┬───────────────────────────┘
+       │
+  /gt_pub/pose   /gt_pub/path   /gt_pub/odometry
 ```
 
 ---
 
-## 2. Feature extraction — SuperPoint + LightGlue
+## 2. Feature tracking — Shi-Tomasi + KLT
 
-### SuperPoint
+### Corner detection — Shi-Tomasi
 
-SuperPoint ([DeTone et al., 2018](https://arxiv.org/abs/1712.07629)) is a self-supervised CNN
-that jointly detects keypoints and computes their descriptors in a single forward pass.
+`cv2.goodFeaturesToTrack` detects corners by maximising the minimum eigenvalue of the
+local gradient structure tensor. For each candidate pixel (x, y):
 
-Given a grayscale image **I** ∈ ℝ^{H×W}, the network produces:
+```
+M = Σ_{patch} [ Ix²   Ix·Iy ]
+               [ Ix·Iy  Iy² ]
 
-- **Keypoints** p_i ∈ ℝ² (sub-pixel 2D image coordinates)
-- **Descriptors** d_i ∈ ℝ^{256} (L2-normalised)
-- **Confidence scores** s_i ∈ [0, 1]
+score = λ_min(M)
+```
 
-The encoder is a VGG-style backbone; the decoder has two heads — one for interest-point
-heatmaps and one for descriptor maps. Up to 2048 keypoints are extracted per image.
+A point is accepted if `score ≥ qualityLevel × max_score` and its nearest accepted
+neighbour is at least `minDistance` pixels away (non-maximum suppression).
 
-**Why SuperPoint?** Classical detectors (SIFT, ORB) rely on hand-crafted gradients.
-SuperPoint learns to detect repeatable, matchable interest points from synthetic homographic
-transformations, giving it strong performance under illumination change and viewpoint variation.
+**Key parameters** (defaults in `FeatureExtractor.__init__`):
 
-### LightGlue
+| Parameter | Default | Effect |
+|---|---|---|
+| `max_corners` | 100 | Cap on detected corners per frame |
+| `quality_level` | 0.5 | Fraction of best score; higher → fewer, stronger corners |
+| `min_distance` | 20 px | Spatial spread; larger → better-conditioned geometry |
 
-LightGlue ([Lindenberger et al., 2023](https://arxiv.org/abs/2306.13643)) is a graph-neural-
-network-based matcher that computes soft correspondences between two sets of SuperPoint
-keypoints.
+**Re-detection:** When the tracked count falls below `max_corners // 2`, fresh corners are
+detected in image regions not already covered by existing tracks (exclusion mask with radius
+`min_distance`), up to the cap.
 
-For two images A and B with keypoints {p_i^A, d_i^A} and {p_j^B, d_j^B}, LightGlue:
+### Tracking — KLT Lucas-Kanade
 
-1. Encodes each keypoint with a positional encoding:
+`cv2.calcOpticalFlowPyrLK` minimises the photometric error in a local patch around each
+corner across a Gaussian image pyramid:
 
-   ```
-   f_i = MLP([d_i, PE(p_i)])
-   ```
+```
+E(u, v) = Σ_{(x,y)∈patch} [ I(x, y, t) − I(x+u, y+v, t+1) ]²
+```
 
-2. Applies L layers of attentional graph neural network (self + cross attention):
+The pyramid (depth `max_level = 3`) allows tracking across large inter-frame displacements:
+each level halves resolution, so the coarsest level handles motions up to
+`win_size × 2^max_level` pixels.
 
-   ```
-   f_i ← f_i + Σ_j α_{ij} · W · f_j
-   ```
+**Key parameters:**
 
-3. Computes a partial assignment matrix **S** ∈ ℝ^{(N+1)×(M+1)} (augmented with dustbin rows/
-   columns for unmatched keypoints) via a differentiable Sinkhorn solver.
-
-4. The final matches M = {(i, j) | argmax_j S_{ij} = j ∧ argmax_i S_{ij} = i} give mutual
-   nearest-neighbour correspondences with confidence scores.
-
-**Adaptive early exit:** LightGlue stops processing easy image pairs at earlier layers,
-making it significantly faster than LoFTR or full SuperGlue on sequences with many similar
-consecutive frames.
-
-**Why LightGlue over traditional matchers?**
-Nearest-neighbour matching on raw descriptors is O(NM) and requires careful ratio-test tuning.
-LightGlue encodes geometric context (keypoint position relative to the image), is end-to-end
-trained for matching quality, and explicitly handles unmatched points — giving cleaner
-correspondences for downstream geometry.
-
-### GPU acceleration
-
-SuperPoint and LightGlue are PyTorch models. On a mid-range GPU (e.g., RTX 3060):
-
-| Platform | ~throughput |
-|---|---|
-| CUDA GPU | 15–25 Hz (stereo + temporal pass) |
-| CPU | 1–3 Hz |
-
-The node automatically falls back to CPU if CUDA is unavailable, but real-time operation
-requires a GPU. Set the `device` parameter to `"cuda"` to force GPU, or leave blank for
-auto-detection.
+| Parameter | Default | Effect |
+|---|---|---|
+| `win_size` | (14, 14) | Patch size per pyramid level; larger handles faster motion |
+| `max_level` | 3 | Pyramid depth; 0 = no pyramid |
 
 ---
 
-## 3. 4-way circular consistency check
+## 3. Forward-backward circular consistency check
 
-Raw LightGlue matches can still contain outliers. The pipeline performs a **4-way circular
-check** across the stereo-temporal track quadruplet before any geometry is computed.
-
-### The four match chains
-
-For each consecutive frame pair (t−1, t), four LightGlue match sets are computed:
+Raw KLT tracks are noisy near occlusion boundaries and textureless regions. Each track is
+validated with a **forward-backward (circular) check**:
 
 ```
-M_LL : L_{t-1} → L_t          (temporal left)
-M_LR : L_t     → R_t          (stereo current)
-M_RR : R_t     → R_{t-1}      (temporal right, reversed)
-M_RL : L_{t-1} → R_{t-1}      (stereo previous)
+1. Track p₀ forward  (img₀ → img₁):  p₁ = KLT(img₀, img₁, p₀)
+2. Track p₁ backward (img₁ → img₀):  p̂₀ = KLT(img₁, img₀, p₁)
+3. Accept if ‖p₀ − p̂₀‖₂ < threshold   (default 2 px)
 ```
 
-### Consistency criterion
+This is applied independently for **temporal** tracks (left_{t−1} → left_t) and **stereo**
+matches (left_t → right_t).
 
-Starting from keypoint **i** in L_{t−1}, the chain is followed:
-
-```
-i  →[M_LL]→  j  →[M_LR]→  k  →[M_RR]→  l  →[M_RL^{-1}]→  î
-```
-
-The track is accepted only if the **loop-closure reprojection error** is below a pixel
-threshold τ:
+Tracks that survive both checks yield index-aligned quadruples:
 
 ```
-‖p^{L_{t-1}}_i  −  p^{L_{t-1}}_î‖₂  ≤  τ   (default τ = 2 px)
+kpts_l_prev  (N,2)   kpts_l_curr  (N,2)
+kpts_r_prev  (N,2)   kpts_r_curr  (N,2)
 ```
 
-A track that passes carries four geometrically consistent 2D observations:
-
-```
-circular_tracks = {
-  kpts_l_prev (N,2),   kpts_l_curr (N,2),
-  kpts_r_prev (N,2),   kpts_r_curr (N,2)
-}
-```
-
-This provides two stereo pairs and two temporal correspondences from a single verification
-step, with no additional LightGlue calls required. The typical outlier rejection rate is
-50–80%, leaving a clean set of tracks for triangulation and PnP.
+providing two stereo pairs and two temporal correspondences from a single verification step
+with no additional feature-matching calls.
 
 ---
 
@@ -192,14 +157,8 @@ step, with no additional LightGlue calls required. The typical outlier rejection
 
 ### Projection matrices
 
-Given camera intrinsics **K₀**, **K₁** and the stereo extrinsic **T_{c₁c₀}** (transform
-that maps cam0 coordinates to cam1 coordinates, derived from the Kalibr calibration):
-
-```
-T_{c₁c₀} = T_{bc₁}⁻¹ · T_{bc₀}
-```
-
-The projection matrices (cam0 as reference frame) are:
+Given camera intrinsics **K₀**, **K₁** and the stereo extrinsic **T_{c₁c₀}** derived from
+the Kalibr calibration (`T_b_c1⁻¹ @ T_b_c0`):
 
 ```
 P₀ = K₀ · [I | 0]
@@ -208,146 +167,186 @@ P₁ = K₁ · [R_{c₁c₀} | t_{c₁c₀}]
 
 ### Undistortion
 
-SuperPoint keypoints are detected on the original (distorted) images. Before any geometry,
-all keypoints are mapped to ideal (undistorted) pixel coordinates using the radial-tangential
-distortion model:
+Keypoints are detected on original (distorted) images. Before any geometry, all points are
+mapped to ideal pixel coordinates using the radial-tangential model:
 
 ```
 p_u = undistortPoints(p_d, K, [k₁, k₂, p₁, p₂], P=K)
 ```
 
-This ensures a consistent pinhole model throughout.
-
 ### DLT triangulation
 
-For a matched pair (p₀, p₁) in undistorted pixel coordinates, the homogeneous 3D point
-**X** is recovered by solving the linear system (Direct Linear Transform):
+For each stereo-matched pair (p₀, p₁), the 3D point **X** is found by solving:
 
 ```
 [p₀ × P₀] · X = 0
 [p₁ × P₁]
 ```
 
-using `cv2.triangulatePoints`. Points with depth Z < 0.1 m or Z > 30 m (configurable) are
-discarded to remove degenerate stereo observations.
+via `cv2.triangulatePoints`. Points with depth Z < 0.1 m or Z > `max_depth` (default 30 m)
+are discarded.
 
 ---
 
 ## 5. Pose estimation — PnP-RANSAC
 
-### Problem statement
+### Problem
 
-Given N 3D landmarks {X_i} triangulated in cam0_{t−1} frame and their 2D observations
-{p_i} in the cam0_t image, find the rigid transform T such that:
-
-```
-λ · p_i  =  K · (R · X_i + t)
-```
-
-This is the **Perspective-n-Point (PnP)** problem.
-
-### RANSAC + EPnP
-
-`cv2.solvePnPRansac` with `SOLVEPNP_EPNP` is used:
-
-1. **EPnP** ([Lepetit et al., 2009](https://link.springer.com/article/10.1007/s11263-008-0152-6))
-   expresses each 3D point as a weighted sum of four virtual control points, reducing PnP to a
-   linear system solvable in O(N) time.
-
-2. **RANSAC** (200 iterations, reprojection threshold 2 px, confidence 99.9%) randomly samples
-   minimal sets of 4 correspondences, estimates a hypothesis with EPnP, and counts inliers.
-
-### Iterative refinement
-
-The RANSAC solution is used as an initial guess for Levenberg–Marquardt non-linear refinement
-(`SOLVEPNP_ITERATIVE`) on the full inlier set, minimising total reprojection error:
+Given N 3D landmarks {X_i} triangulated from the **previous** stereo pair and their 2D
+observations {p_i} in the **current** left image:
 
 ```
-{R*, t*} = argmin_{R,t} Σ_{i∈inliers} ‖p_i − π(K, R, t, X_i)‖²
+λ · p_i = K · (R · X_i + t)
 ```
+
+### RANSAC + EPnP + iterative refinement
+
+1. `cv2.solvePnPRansac` with `SOLVEPNP_EPNP` (200 iterations, 2 px threshold, 99.9%
+   confidence) finds an initial consensus set.
+2. Levenberg–Marquardt (`SOLVEPNP_ITERATIVE`) refines on the full inlier set.
 
 ### Layered outlier rejection
 
 | Guard | Condition | Rejects |
 |---|---|---|
-| Depth filter | 0.1 m < Z < 30 m | Far/noisy stereo points |
-| Minimum count | N_valid ≥ 6 | Degenerate configurations |
-| Inlier ratio | n_inliers / N ≥ 0.4 | RANSAC on corrupt consensus |
-| Max translation | ‖t‖ ≤ 0.5 m / frame | Pose jumps |
-| Max rotation | angle ≤ 30° / frame | Orientation flips |
-
-If any guard fires, the frame is **skipped** and the last accepted pose is held.
+| Depth filter | 0.1 m < Z < 30 m | Noisy/degenerate stereo points |
+| Minimum count | N_valid ≥ 6 | Under-determined PnP |
+| Inlier ratio | n_inliers / N ≥ 0.4 | Corrupt RANSAC consensus |
+| Max translation | ‖t‖ ≤ 0.5 m/frame | Pose jumps |
+| Max rotation | angle ≤ 30°/frame | Orientation flips |
 
 ### Pose accumulation
 
-`solvePnPRansac` returns **T_{curr,prev}** — the transform that maps cam0_{t-1} coordinates
-to cam0_t. The world-frame cam0 pose is updated by right-multiplication of the inverse:
+`solvePnPRansac` returns **T_{curr,prev}**. The world-frame cam0 pose is updated as:
 
 ```
 T_{world,cam0}^{t} = T_{world,cam0}^{t-1} · T_{curr,prev}⁻¹
-```
-
-The published body pose is then:
-
-```
-T_{world,body} = T_{world,cam0} · T_{bc0}⁻¹
+T_{world,body}      = T_{world,cam0} · T_{bc0}⁻¹
 ```
 
 ---
 
-## 6. Coordinate frames
+## 6. IMU processing
+
+`ImuProcessingNode` preprocesses raw IMU data before ESKF fusion.
+
+### Static initialisation
+
+On startup the node collects `init_duration` seconds of static data to estimate:
+
+- **Gyroscope bias** `b_g = mean(ω_raw)` — at rest, ideal ω = 0
+- **Accelerometer bias** `b_a = mean(a_raw) − R_{bw} · g_reaction`
+- **Initial orientation** — roll and pitch from gravity direction (yaw = 0, unobservable)
+
+### Pipeline (per sample)
+
+```
+raw IMU
+  │
+  ├─ bias subtraction: a_corr = a_raw − b_a,  ω_corr = ω_raw − b_g
+  │
+  ├─ 2nd-order Butterworth LPF (biquad, bilinear transform)
+  │     gyro:  cutoff 15 Hz
+  │     accel: cutoff 10 Hz
+  │
+  ├─ dead-reckoning integration (attitude + velocity + position)
+  │
+  └─ publish /imu/processed, /imu/odometry, /imu/pose, /imu/rpy
+```
+
+The dead-reckoning output drifts without fusion — it is useful for debugging sensor health
+and comparing against the ESKF output.
+
+---
+
+## 7. Error-State Kalman Filter (ESKF)
+
+`EskfNode` fuses bias-corrected IMU measurements (200 Hz) with visual odometry pose
+updates (20 Hz).
+
+### State vector
+
+```
+x  = [p(3)  v(3)  q(4)  b_a(3)  b_g(3)]    nominal state (16-DOF)
+δx = [δp(3) δv(3) δθ(3) δb_a(3) δb_g(3)]   error state   (15-DOF)
+```
+
+### Prediction (every IMU sample, dt ≈ 5 ms)
+
+```
+a_w   = R·(f − b_a) + g          world-frame acceleration
+p    ← p + v·dt + ½·a_w·dt²
+v    ← v + a_w·dt
+q    ← q ⊗ Exp((ω − b_g)·dt)
+P    ← F·P·Fᵀ + Qd
+```
+
+Process noise `Qd` is built from IMU noise densities in `euroc_params.yaml`
+(accel σ_a, gyro σ_g, accel bias walk σ_ba, gyro bias walk σ_bg).
+
+### Update (every VIO frame, dt ≈ 50 ms)
+
+Innovation vector (6-DOF):
+
+```
+z = [ p_meas − p_nom ;  Log(R_nom.T @ R_meas) ]
+```
+
+Joseph-form update for numerical stability:
+
+```
+S      = H·P·Hᵀ + R_meas
+K      = P·Hᵀ·S⁻¹
+IKH    = I₁₅ − K·H
+P     ← IKH·P·IKHᵀ + K·R_meas·Kᵀ
+δx    = K·z   →   inject into nominal state
+```
+
+### Gravity estimation
+
+On the first VIO pose the ESKF rotates the mean static accelerometer reading into the VIO
+world frame to obtain `g_world`, avoiding reliance on the hardcoded `[0, 0, -9.81]` vector.
+
+---
+
+## 8. Coordinate frames
 
 ### Kalibr convention (T_BS)
-
-All extrinsic matrices use the Kalibr convention:
 
 ```
 p_body = T_BS · p_sensor
 ```
 
-So `T_BS` (named `T_b_c0` in code) transforms a point expressed in the **sensor** frame
-into the **body** frame.
+`T_BS` (code: `T_b_c0`) maps a point in the **sensor** frame to the **body** frame.
 
 ### World frame
 
-The world frame is defined as the **initial body frame** (FLU — Forward, Left, Up):
+Defined as the **initial body frame** (FLU — Forward, Left, Up):
 
 ```
-+X  →  forward    (body x at t=0)
-+Y  →  left       (body y at t=0)
-+Z  →  up         (body z at t=0, approximately anti-gravity)
++X → forward   (body x at t=0)
++Y → left      (body y at t=0)
++Z → up        (body z at t=0, approximately anti-gravity)
 ```
 
-Initialising `T_{world,cam0} = T_{bc0}` (instead of identity) ensures that at t=0:
-
-```
-T_{world,body}^{0} = T_{bc0} · T_{bc0}⁻¹ = I
-```
-
-Both the odometry and the aligned ground truth start at the origin with identity
-orientation, making trajectory comparison direct.
+Initialising `T_{world,cam0} = T_{bc0}` ensures `T_{world,body}^{0} = I`, so both
+odometry and aligned ground truth start at the origin with identity orientation.
 
 ### Ground truth alignment
 
-The Vicon ground truth is expressed in the Vicon world frame. To align it to the odometry
-world frame (initial body frame):
-
 ```
-T_align = T_{vicon,body_0}⁻¹
-
-T_{world,body}^{GT}(t) = T_align · T_{vicon,body}(t)
+T_align              = T_{vicon,body_0}⁻¹
+T_{world,body}^GT(t) = T_align · T_{vicon,body}(t)
 ```
-
-At t=0 this evaluates to identity, matching the odometry initial condition.
 
 ---
 
-## 7. Project structure
+## 9. Project structure
 
 ```
-VIO_new/
-├── requirements.txt
+Visual_Inertial_Odometry/
 ├── README.md
+├── requirements.txt
 └── ros2_ws/
     └── src/
         └── vio_pipeline/
@@ -355,29 +354,35 @@ VIO_new/
             ├── setup.py
             ├── setup.cfg
             ├── config/
-            │   └── euroc_params.yaml       # Camera + IMU calibration
+            │   └── euroc_params.yaml          # Camera + IMU calibration
             ├── launch/
-            │   ├── full_pipeline.launch.py # Pose estimation + GT publisher
-            │   └── features.launch.py      # Feature visualisation only
+            │   ├── full_pipeline.launch.py    # Full VIO + ESKF + GT
+            │   └── features.launch.py         # Feature visualisation only
             └── vio_pipeline/
-                ├── feature_extraction.py   # SuperPoint + LightGlue wrapper,
-                │                           # 4-way circular check
-                ├── feature_tracking_node.py# Debug visualisation node
-                ├── vio_node.py             # PoseEstimationNode (main pipeline)
-                └── ground_truth_publisher.py # Aligned GT republisher
+                ├── feature_tracking_KLT.py    # Shi-Tomasi + KLT tracker,
+                │                              # forward-backward consistency check
+                ├── feature_tracking_node.py   # Standalone feature viz node
+                ├── vio_node.py                # PoseEstimationNode
+                ├── imu_processing_node.py     # Bias removal, LPF, dead-reckoning
+                ├── eskf_node.py               # Error-State Kalman Filter
+                ├── ground_truth_publisher.py  # Aligned Vicon GT republisher
+                └── debug_logger_node.py       # CSV trajectory logger
 ```
 
 ### Node summary
 
-| Node | Executable | Purpose |
-|---|---|---|
-| `PoseEstimationNode` | `pose_estimation_node` | Feature tracking → triangulation → PnP → publish pose |
-| `FeatureTrackingNode` | `feature_tracking_node` | Standalone feature viz (debug) |
-| `GroundTruthPublisherNode` | `ground_truth_publisher` | Align Vicon GT to odometry frame |
+| Node | Executable | Rate | Purpose |
+|---|---|---|---|
+| `PoseEstimationNode` | `pose_estimation_node` | 20 Hz | KLT tracking → triangulation → PnP → pose |
+| `ImuProcessingNode` | `imu_processing_node` | 200 Hz | Bias removal, LPF, dead-reckoning |
+| `EskfNode` | `eskf_node` | 200 Hz | IMU + VIO fusion |
+| `FeatureTrackingNode` | `feature_tracking_node` | 20 Hz | Feature visualisation (debug) |
+| `GroundTruthPublisherNode` | `ground_truth_publisher` | — | Aligned Vicon GT |
+| `DebugLoggerNode` | `debug_logger_node` | — | CSV trajectory logger |
 
 ---
 
-## 8. Requirements and installation
+## 10. Requirements and installation
 
 ### System requirements
 
@@ -386,51 +391,28 @@ VIO_new/
 | OS | Ubuntu 22.04 | Ubuntu 22.04 / 24.04 |
 | ROS 2 | Humble | Jazzy |
 | Python | 3.10 | 3.11 |
-| GPU | — (CPU fallback) | 2GB+ VRAM |
+| GPU | — | not required for KLT branch |
 
+No deep-learning dependencies. The KLT branch runs in real-time on CPU.
 
 ### 1. Install ROS 2
 
-Follow the official ROS 2 installation guide for your distribution.
+Follow the [official ROS 2 installation guide](https://docs.ros.org/en/humble/Installation.html).
 
-### 2. Install PyTorch (GPU)
-
-```bash
-# Check your CUDA version first:
-nvidia-smi
-
-# Install matching PyTorch build (example: CUDA 12.1):
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-
-# CPU-only (real-time performance not guaranteed):
-pip install torch torchvision
-```
-
-### 3. Install LightGlue
-
-LightGlue is not on PyPI and must be installed from source:
-
-```bash
-pip install git+https://github.com/cvg/LightGlue.git
-```
-
-### 4. Install remaining Python dependencies
+### 2. Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> **Note:** Skip the `torch`/`torchvision` lines in `requirements.txt` if you already
-> installed a CUDA build in step 2, to avoid overwriting with the CPU version.
-
-### 5. Install ROS 2 package dependencies
+### 3. Install ROS 2 package dependencies
 
 ```bash
 cd ros2_ws
 rosdep install --from-paths src -y --ignore-src
 ```
 
-### 6. Build and source
+### 4. Build and source
 
 ```bash
 cd ros2_ws
@@ -440,12 +422,14 @@ source install/setup.bash
 
 ---
 
-## 9. Running the pipeline
+## 11. Running the pipeline
 
 ### Prepare the EuRoC bag
 
-Download an EuRoC sequence (e.g. MH_01_easy) and convert to ROS 2 bag format, or use a
-pre-converted bag. Place it at `bags/euroc_mav0/`.
+Download an EuRoC sequence (e.g. MH_01_easy) and convert to ROS 2 bag format.
+Place it at `bags/euroc_mav0/`.
+
+The [euroc_to_rosbag2](scripts/) conversion script is included in the repository.
 
 ### Terminal A — play the bag
 
@@ -453,98 +437,132 @@ pre-converted bag. Place it at `bags/euroc_mav0/`.
 ros2 bag play bags/euroc_mav0 --rate 0.5 --clock
 ```
 
-`--rate 0.5` plays at half speed. Remove it (or increase) once you have GPU acceleration.
+`--rate 0.5` plays at half speed; remove once timing is confirmed.
 `--clock` publishes `/clock` so nodes use simulated time.
 
-### Terminal B — launch the pipeline
+### Terminal B — launch the full pipeline
 
 ```bash
-# Full pipeline (pose estimation + ground truth)
 ros2 launch vio_pipeline full_pipeline.launch.py
-
-# Feature visualisation only (debug)
-ros2 launch vio_pipeline features.launch.py
 ```
 
-Override defaults with launch arguments:
+Override config or timing:
 
 ```bash
 ros2 launch vio_pipeline full_pipeline.launch.py \
-    config_file:=/path/to/custom_params.yaml \
+    config_file:=/path/to/euroc_params.yaml \
     use_sim_time:=true
 ```
 
 ### Terminal C — inspect output
 
 ```bash
-# Live pose stream
-ros2 topic echo /vio/pose
+# Live fused pose (ESKF)
+ros2 topic echo /eskf/pose
 
-# Topic rates
-ros2 topic hz /vio/pose
-ros2 topic hz /gt_pub/pose
+# Compare VIO-only vs fused
+ros2 topic hz /vio/pose /eskf/pose
 
-# RViz (add Path displays for /vio/path and /gt_pub/path)
+# Plot RPY
+ros2 run rqt_plot rqt_plot \
+    /eskf/rpy/vector/x \
+    /eskf/rpy/vector/y \
+    /eskf/rpy/vector/z \
+    /imu/rpy/vector/x \
+    /imu/rpy/vector/y \
+    /imu/rpy/vector/z
+
+# RViz — add Path displays for:
+#   /vio/path, /eskf/... path (via odometry), /gt_pub/path
 rviz2
 ```
 
-### Feature tracking only
+### Feature visualisation only
 
 ```bash
 ros2 launch vio_pipeline features.launch.py
-# Then view in RViz: /features/viz, /features/temporal_viz
+# /features/viz         — stereo matches (left | right)
+# /features/temporal_viz — KLT motion trails
 ```
 
 ---
 
-## 10. ROS 2 topics and parameters
+## 12. ROS 2 topics and parameters
 
 ### Published topics
 
 | Topic | Type | Node | Description |
 |---|---|---|---|
-| `/vio/pose` | `PoseStamped` | PoseEstimation | Body pose in world frame |
-| `/vio/path` | `Path` | PoseEstimation | Full trajectory history |
-| `/vio/odometry` | `Odometry` | PoseEstimation | Body odometry (`child_frame_id=base_link`) |
-| `/gt_pub/pose` | `PoseStamped` | GroundTruth | Aligned ground truth pose |
-| `/gt_pub/path` | `Path` | GroundTruth | Ground truth trajectory |
-| `/gt_pub/odometry` | `Odometry` | GroundTruth | Ground truth odometry |
+| `/vio/pose` | `PoseStamped` | PoseEstimation | Camera-only body pose |
+| `/vio/path` | `Path` | PoseEstimation | Camera-only trajectory |
+| `/vio/odometry` | `Odometry` | PoseEstimation | Camera-only odometry |
+| `/vio/rpy` | `Vector3Stamped` | PoseEstimation | Roll/pitch/yaw in degrees |
+| `/eskf/odometry` | `Odometry` | ESKF | Fused pose + velocity |
+| `/eskf/pose` | `PoseStamped` | ESKF | Fused pose |
+| `/eskf/rpy` | `Vector3Stamped` | ESKF | Fused roll/pitch/yaw in degrees |
+| `/imu/processed` | `Imu` | ImuProcessing | Bias-corrected + filtered IMU |
+| `/imu/odometry` | `Odometry` | ImuProcessing | IMU dead-reckoning |
+| `/imu/pose` | `PoseStamped` | ImuProcessing | IMU dead-reckoning pose |
+| `/imu/rpy` | `Vector3Stamped` | ImuProcessing | IMU dead-reckoning RPY (degrees) |
+| `/gt_pub/pose` | `PoseStamped` | GroundTruth | Aligned Vicon pose |
+| `/gt_pub/path` | `Path` | GroundTruth | Aligned Vicon trajectory |
+| `/gt_pub/odometry` | `Odometry` | GroundTruth | Aligned Vicon odometry |
 | `/features/viz` | `Image` | FeatureTracking | Stereo match visualisation |
-| `/features/temporal_viz` | `Image` | FeatureTracking | Temporal track visualisation |
+| `/features/temporal_viz` | `Image` | FeatureTracking | KLT motion trails |
 
 ### Subscribed topics
 
-| Topic | Type | Node |
+| Topic | Type | Subscribers |
 |---|---|---|
 | `/cam0/image_raw` | `Image` | PoseEstimation, FeatureTracking |
 | `/cam1/image_raw` | `Image` | PoseEstimation, FeatureTracking |
-| `/vicon0/pose` (configurable) | `PoseStamped` | GroundTruth |
+| `/imu0` | `Imu` | ImuProcessing, ESKF (raw buffer) |
+| `/imu/processed` | `Imu` | ESKF |
+| `/vio/odometry` | `Odometry` | ESKF |
+| `/gt/pose` (configurable) | `PoseStamped` | GroundTruth |
 
 ### PoseEstimationNode parameters
 
 | Parameter | Default | Description |
 |---|---|---|
 | `config_path` | `""` | Path to `euroc_params.yaml` |
-| `device` | `""` | `"cuda"` or `"cpu"` (blank = auto) |
-| `min_tracks` | `10` | Min circular-checked tracks to attempt PnP |
-| `circular_check_threshold` | `2.0` | Max loop-closure pixel error (px) |
+| `min_tracks` | `10` | Minimum circular-checked tracks to attempt PnP |
+| `circular_check_threshold` | `2.0` | Max forward-backward pixel error (px) |
 | `max_depth` | `30.0` | Max triangulated point depth (m) |
 | `min_inlier_ratio` | `0.4` | Min RANSAC inlier fraction |
 | `max_translation` | `0.5` | Max accepted per-frame translation (m) |
 | `max_rotation_deg` | `30.0` | Max accepted per-frame rotation (deg) |
 
-### GroundTruthPublisherNode parameters
+### ImuProcessingNode parameters
 
 | Parameter | Default | Description |
 |---|---|---|
 | `config_path` | `""` | Path to `euroc_params.yaml` |
-| `gt_topic` | `"/gt/pose"` | Input ground truth topic |
+| `imu_topic` | `"/imu0"` | Raw IMU input topic |
+| `init_duration` | `2.0` | Static initialisation window (s) |
+| `gyro_lpf_cutoff` | `20.0` | Gyro low-pass filter cutoff (Hz) |
+| `accel_lpf_cutoff` | `20.0` | Accel low-pass filter cutoff (Hz) |
+| `imu_rate_hz` | `200` | Expected IMU sample rate |
+
+### EskfNode parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `config_path` | `""` | Path to `euroc_params.yaml` (IMU noise figures) |
+| `meas_pos_std` | `0.05` | VIO position noise 1-σ (m). Lower → trust VIO more |
+| `meas_ang_std` | `0.02` | VIO rotation noise 1-σ (rad). Lower → trust VIO more |
+| `init_pos_std` | `1.0` | Initial position uncertainty (m) |
+| `init_vel_std` | `0.5` | Initial velocity uncertainty (m/s) |
+| `init_att_std` | `0.1` | Initial attitude uncertainty (rad, ≈5.7°) |
+| `init_ba_std` | `0.02` | Initial accel-bias uncertainty (m/s²) |
+| `init_bg_std` | `5e-4` | Initial gyro-bias uncertainty (rad/s) |
+| `max_dt` | `0.1` | Max IMU dt before sample is discarded (s) |
 
 ---
 
-## 11. Configuration file
+## 13. Configuration file
 
-`config/euroc_params.yaml` stores the EuRoC VI-Sensor calibration:
+`config/euroc_params.yaml` stores the EuRoC VI-Sensor calibration used by all nodes:
 
 ```yaml
 cam0:
@@ -562,86 +580,12 @@ cam1:
 stereo_baseline: 0.11007                 # ‖t_{c₀c₁}‖ in metres
 
 imu:
-  gyro_noise:  1.6968e-04               # rad/s/√Hz
+  gyro_noise:  1.6968e-04               # rad/s/√Hz   — process noise Q
   gyro_walk:   1.9393e-05               # rad/s²/√Hz
   accel_noise: 2.0000e-03               # m/s²/√Hz
   accel_walk:  3.0000e-03               # m/s³/√Hz
   rate_hz: 200
   T_BS: [identity]                       # IMU = body for EuRoC
 
-gravity: [0.0, 0.0, -9.81]
+gravity: [0.0, 0.0, -9.81]              # overridden by ESKF gravity estimator
 ```
-
----
-
-## 12. Future work — IMU fusion with ESKF
-
-The current pipeline is **vision-only**. Integrating IMU measurements will improve robustness
-during fast motion and provide a well-defined gravity-aligned world frame. The planned approach
-is an **Error-State Kalman Filter (ESKF)**.
-
-### State vector
-
-The nominal state at time t is:
-
-```
-x = [p, v, q, b_a, b_g]  ∈  ℝ³ × ℝ³ × SO(3) × ℝ³ × ℝ³
-```
-
-where **p** is position, **v** velocity, **q** orientation quaternion, **b_a** accelerometer
-bias, **b_g** gyroscope bias. The error state **δx** lives in ℝ^{15}.
-
-### IMU pre-integration (prediction step)
-
-Between camera frames at times t_{k} and t_{k+1}, IMU measurements {a_m, ω_m} are integrated
-to propagate the nominal state:
-
-```
-p_{k+1} = p_k + v_k·Δt + ½(R_k·(a_m − b_a) + g)·Δt²
-v_{k+1} = v_k + (R_k·(a_m − b_a) + g)·Δt
-R_{k+1} = R_k · Exp((ω_m − b_g)·Δt)
-```
-
-The error-state covariance **P** is propagated via the linearised dynamics:
-
-```
-P_{k+1} = F·P_k·Fᵀ + G·Q·Gᵀ
-```
-
-where **F** is the state transition Jacobian, **G** the noise input matrix, and **Q** the
-IMU noise covariance (diagonal, loaded from `euroc_params.yaml`).
-
-### Visual update step
-
-When a new camera frame arrives, the PnP reprojection residual for each landmark provides
-an observation:
-
-```
-z_i = p_i − π(K, T_{body→cam0}, T_{world,body}, X_i)
-```
-
-The linearised measurement Jacobian **H_i** maps the error state to residual space.
-The Kalman gain and state correction follow the standard EKF update:
-
-```
-K  = P·Hᵀ·(H·P·Hᵀ + R)⁻¹
-δx = K·z
-P  = (I − K·H)·P
-```
-
-After the update the nominal state is reset:
-```
-x ← x ⊕ δx,   P ← reset(P)
-```
-
-### Expected benefits over vision-only
-
-| Limitation (current) | ESKF solution |
-|---|---|
-| Jumps during fast rotation | IMU provides smooth attitude between frames |
-| World frame not gravity-aligned | Gravity from accelerometer init fixes z-up |
-| Scale drift accumulates | IMU constrains velocity and scale |
-| Tracking loss = lost pose | IMU propagates pose through dark/blurry frames |
-
-The IMU parameters already present in `euroc_params.yaml` (noise densities, random walks) are
-the exact inputs needed to build the process noise matrix **Q** for the ESKF.
