@@ -92,8 +92,8 @@ def generate_launch_description():
                     {
                         "config_path": LaunchConfiguration("config_file"),
                         "use_sim_time": LaunchConfiguration("use_sim_time"),
-                        "meas_pos_std": 0.05,
-                        "meas_ang_std": 0.02,
+                        "meas_pos_std": 0.1,
+                        "meas_ang_std": 1.0,
                     }
                 ],
             ),

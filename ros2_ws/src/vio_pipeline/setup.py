@@ -29,6 +29,7 @@ setup(
             "imu_processing_node = vio_pipeline.imu_processing_node:main",
             "eskf_node = vio_pipeline.eskf_node:main",
             "debug_logger_node = vio_pipeline.debug_logger_node:main",
+            "tf_publisher_node = vio_pipeline.tf_publisher_node:main",
         ],
     },
 )

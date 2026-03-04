@@ -94,9 +94,7 @@ import yaml
 def _skew(v: np.ndarray) -> np.ndarray:
     """3-vector → 3×3 skew-symmetric (cross-product) matrix."""
     return np.array(
-        [[0.0,  -v[2],  v[1]],
-         [v[2],  0.0,  -v[0]],
-         [-v[1], v[0],  0.0]],
+        [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]],
         dtype=np.float64,
     )
 
@@ -106,9 +104,9 @@ def _quat_to_rot(q: np.ndarray) -> np.ndarray:
     x, y, z, w = q
     return np.array(
         [
-            [1 - 2*(y*y + z*z),  2*(x*y - w*z),   2*(x*z + w*y)],
-            [2*(x*y + w*z),      1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-            [2*(x*z - w*y),      2*(y*z + w*x),   1 - 2*(x*x + y*y)],
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
         ],
         dtype=np.float64,
     )
@@ -150,10 +148,10 @@ def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     x2, y2, z2, w2 = q2
     return np.array(
         [
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2,
-            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
         ],
         dtype=np.float64,
     )
@@ -176,7 +174,7 @@ def _exp_so3(phi: np.ndarray) -> np.ndarray:
     axis = phi / angle
     s = np.sin(angle * 0.5)
     return np.array(
-        [axis[0]*s, axis[1]*s, axis[2]*s, np.cos(angle * 0.5)],
+        [axis[0] * s, axis[1] * s, axis[2] * s, np.cos(angle * 0.5)],
         dtype=np.float64,
     )
 
@@ -210,27 +208,33 @@ class EskfNode(Node):
       RUNNING  IMU prediction + VIO update loop active.
     """
 
-    _UNINIT  = "uninit"
+    _UNINIT = "uninit"
     _RUNNING = "running"
 
     def __init__(self) -> None:
         super().__init__("eskf_node")
 
         # ── Parameters ──────────────────────────────────────────────────────
-        self.declare_parameter("config_path",  "")
-        self.declare_parameter("meas_pos_std", 0.05)   # m
-        self.declare_parameter("meas_ang_std", 0.02)   # rad
-
-        config_path  = self.get_parameter("config_path").value
+        self.declare_parameter("config_path", "")
+        self.declare_parameter("meas_pos_std", 0.05)  # m
+        self.declare_parameter("meas_ang_std", 0.02)  # rad
+        self.get_logger().info(
+            "ESKF node parameters: pos_std=%.3f, ang_std=%.3f"
+            % (
+                self.get_parameter("meas_pos_std").value,
+                self.get_parameter("meas_ang_std").value,
+            )
+        )
+        config_path = self.get_parameter("config_path").value
         meas_pos_std = float(self.get_parameter("meas_pos_std").value)
         meas_ang_std = float(self.get_parameter("meas_ang_std").value)
 
         # ── IMU noise figures (EuRoC defaults, overridden by YAML) ───────────
         self._gravity = np.array([0.0, 0.0, -9.81], dtype=np.float64)
-        sigma_a  = 2.0e-3       # accel  noise density  [m/s²/√Hz]
-        sigma_g  = 1.6968e-4    # gyro   noise density  [rad/s/√Hz]
-        sigma_ba = 3.0e-3       # accel  bias walk      [m/s³/√Hz]
-        sigma_bg = 1.9393e-5    # gyro   bias walk      [rad/s²/√Hz]
+        sigma_a = 2.0e-3  # accel  noise density  [m/s²/√Hz]
+        sigma_g = 1.6968e-4  # gyro   noise density  [rad/s/√Hz]
+        sigma_ba = 3.0e-3  # accel  bias walk      [m/s³/√Hz]
+        sigma_bg = 1.9393e-5  # gyro   bias walk      [rad/s²/√Hz]
 
         if config_path:
             try:
@@ -240,10 +244,10 @@ class EskfNode(Node):
                     cfg.get("gravity", [0.0, 0.0, -9.81]), dtype=np.float64
                 )
                 imu = cfg.get("imu", {})
-                sigma_a  = float(imu.get("accel_noise", sigma_a))
-                sigma_g  = float(imu.get("gyro_noise",  sigma_g))
-                sigma_ba = float(imu.get("accel_walk",  sigma_ba))
-                sigma_bg = float(imu.get("gyro_walk",   sigma_bg))
+                sigma_a = float(imu.get("accel_noise", sigma_a))
+                sigma_g = float(imu.get("gyro_noise", sigma_g))
+                sigma_ba = float(imu.get("accel_walk", sigma_ba))
+                sigma_bg = float(imu.get("gyro_walk", sigma_bg))
                 self.get_logger().info(f"ESKF config loaded from '{config_path}'.")
             except Exception as exc:
                 self.get_logger().warn(
@@ -251,42 +255,46 @@ class EskfNode(Node):
                 )
 
         # Pre-square noise densities (used every prediction step)
-        self._sa2  = sigma_a  ** 2
-        self._sg2  = sigma_g  ** 2
-        self._sba2 = sigma_ba ** 2
-        self._sbg2 = sigma_bg ** 2
+        self._sa2 = sigma_a**2
+        self._sg2 = sigma_g**2
+        self._sba2 = sigma_ba**2
+        self._sbg2 = sigma_bg**2
 
         # ── Measurement noise R (6×6) ────────────────────────────────────────
         self._R_meas = np.diag(
-            np.concatenate([
-                np.full(3, meas_pos_std ** 2),
-                np.full(3, meas_ang_std ** 2),
-            ])
+            np.concatenate(
+                [
+                    np.full(3, meas_pos_std**2),
+                    np.full(3, meas_ang_std**2),
+                ]
+            )
         )
 
         # ── Nominal state ────────────────────────────────────────────────────
-        self._p   = np.zeros(3, dtype=np.float64)     # position  (world)
-        self._v   = np.zeros(3, dtype=np.float64)     # velocity  (world)
-        self._q   = np.array([0.0, 0.0, 0.0, 1.0])   # attitude  [x,y,z,w]
-        self._b_a = np.zeros(3, dtype=np.float64)     # residual accel bias
-        self._b_g = np.zeros(3, dtype=np.float64)     # residual gyro  bias
+        self._p = np.zeros(3, dtype=np.float64)  # position  (world)
+        self._v = np.zeros(3, dtype=np.float64)  # velocity  (world)
+        self._q = np.array([0.0, 0.0, 0.0, 1.0])  # attitude  [x,y,z,w]
+        self._b_a = np.zeros(3, dtype=np.float64)  # residual accel bias
+        self._b_g = np.zeros(3, dtype=np.float64)  # residual gyro  bias
 
         # ── Error-state covariance P (15×15) ────────────────────────────────
         # Seeded with generous uncertainty; will contract after first VIO update.
         self._P = np.diag(
-            np.concatenate([
-                np.full(3, 1.0),     # δp  [m²]
-                np.full(3, 1.0),     # δv  [m²/s²]
-                np.full(3, 1e-2),    # δθ  [rad²]
-                np.full(3, 1e-4),    # δb_a [m²/s⁴]
-                np.full(3, 1e-6),    # δb_g [rad²/s²]
-            ])
+            np.concatenate(
+                [
+                    np.full(3, 1.0),  # δp  [m²]
+                    np.full(3, 1.0),  # δv  [m²/s²]
+                    np.full(3, 1e-2),  # δθ  [rad²]
+                    np.full(3, 1e-4),  # δb_a [m²/s⁴]
+                    np.full(3, 1e-6),  # δb_g [rad²/s²]
+                ]
+            )
         ).astype(np.float64)
 
         # ── State machine ────────────────────────────────────────────────────
-        self._state         = self._UNINIT
+        self._state = self._UNINIT
         self._last_stamp_ns: int | None = None
-        self._update_count  = 0
+        self._update_count = 0
 
         # ── Raw IMU buffer for gravity estimation ─────────────────────────
         # Collect raw /imu0 accel during the static init window so we can
@@ -303,13 +311,13 @@ class EskfNode(Node):
         )
 
         # ── Publishers ───────────────────────────────────────────────────────
-        self._pub_odom = self.create_publisher(Odometry,    "/eskf/odometry", qos_be)
-        self._pub_pose = self.create_publisher(PoseStamped, "/eskf/pose",     qos_be)
+        self._pub_odom = self.create_publisher(Odometry, "/eskf/odometry", qos_be)
+        self._pub_pose = self.create_publisher(PoseStamped, "/eskf/pose", qos_be)
 
         # ── Subscribers ──────────────────────────────────────────────────────
-        self.create_subscription(Imu,      "/imu0",          self._raw_imu_cb, qos_be)
-        self.create_subscription(Imu,      "/imu/processed", self._imu_cb,     qos_be)
-        self.create_subscription(Odometry, "/vio/odometry",  self._vio_cb,     10)
+        self.create_subscription(Imu, "/imu0", self._raw_imu_cb, qos_be)
+        self.create_subscription(Imu, "/imu/processed", self._imu_cb, qos_be)
+        self.create_subscription(Odometry, "/vio/odometry", self._vio_cb, 10)
 
         self.get_logger().info(
             "EskfNode ready — waiting for first VIO measurement to initialise."
@@ -321,11 +329,16 @@ class EskfNode(Node):
         """Buffer raw accelerometer data during static init for gravity estimation."""
         if self._state != self._UNINIT or len(self._raw_accel_buf) >= self._RAW_BUF_MAX:
             return
-        self._raw_accel_buf.append(np.array([
-            msg.linear_acceleration.x,
-            msg.linear_acceleration.y,
-            msg.linear_acceleration.z,
-        ], dtype=np.float64))
+        self._raw_accel_buf.append(
+            np.array(
+                [
+                    msg.linear_acceleration.x,
+                    msg.linear_acceleration.y,
+                    msg.linear_acceleration.z,
+                ],
+                dtype=np.float64,
+            )
+        )
 
     # ── IMU prediction ─────────────────────────────────────────────────────────
 
@@ -340,12 +353,18 @@ class EskfNode(Node):
         if dt <= 0.0 or dt > 0.1:
             return
 
-        gyro  = np.array([msg.angular_velocity.x,
-                           msg.angular_velocity.y,
-                           msg.angular_velocity.z], dtype=np.float64)
-        accel = np.array([msg.linear_acceleration.x,
-                           msg.linear_acceleration.y,
-                           msg.linear_acceleration.z], dtype=np.float64)
+        gyro = np.array(
+            [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z],
+            dtype=np.float64,
+        )
+        accel = np.array(
+            [
+                msg.linear_acceleration.x,
+                msg.linear_acceleration.y,
+                msg.linear_acceleration.z,
+            ],
+            dtype=np.float64,
+        )
 
         self._predict(gyro, accel, dt)
         self._publish(msg.header)
@@ -353,21 +372,30 @@ class EskfNode(Node):
     # ── VIO update ─────────────────────────────────────────────────────────────
 
     def _vio_cb(self, msg: Odometry) -> None:
-        p_meas = np.array([msg.pose.pose.position.x,
-                            msg.pose.pose.position.y,
-                            msg.pose.pose.position.z], dtype=np.float64)
-        q_meas = np.array([msg.pose.pose.orientation.x,
-                            msg.pose.pose.orientation.y,
-                            msg.pose.pose.orientation.z,
-                            msg.pose.pose.orientation.w], dtype=np.float64)
+        p_meas = np.array(
+            [
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z,
+            ],
+            dtype=np.float64,
+        )
+        q_meas = np.array(
+            [
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
+                msg.pose.pose.orientation.w,
+            ],
+            dtype=np.float64,
+        )
         q_meas /= np.linalg.norm(q_meas)
 
         if self._state == self._UNINIT:
             # Seed nominal state from the first VIO measurement.
             self._p = p_meas.copy()
             self._q = q_meas.copy()
-            stamp_ns = (msg.header.stamp.sec * 1_000_000_000
-                        + msg.header.stamp.nanosec)
+            stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
             self._last_stamp_ns = stamp_ns
 
             # ── Estimate gravity in the VIO world frame ───────────────────
@@ -378,9 +406,9 @@ class EskfNode(Node):
             #   g_world = R_wb_init @ (-f_static_body)
             # This avoids the z-up assumption in the config gravity vector.
             if len(self._raw_accel_buf) >= 10:
-                R_init = _quat_to_rot(q_meas)           # body → VIO world
+                R_init = _quat_to_rot(q_meas)  # body → VIO world
                 f_static = np.mean(self._raw_accel_buf, axis=0)
-                self._gravity = R_init @ (-f_static)    # gravitational accel in world
+                self._gravity = R_init @ (-f_static)  # gravitational accel in world
                 self.get_logger().info(
                     f"ESKF: estimated gravity in VIO world frame: "
                     f"{np.round(self._gravity, 4)}  "
@@ -396,8 +424,7 @@ class EskfNode(Node):
 
             self._state = self._RUNNING
             self.get_logger().info(
-                f"ESKF initialised from first VIO pose: "
-                f"p={np.round(p_meas, 3)}"
+                f"ESKF initialised from first VIO pose: " f"p={np.round(p_meas, 3)}"
             )
             return
 
@@ -419,13 +446,13 @@ class EskfNode(Node):
         R = _quat_to_rot(self._q)
 
         f_corr = accel - self._b_a
-        w_corr = gyro  - self._b_g
+        w_corr = gyro - self._b_g
 
         # ── Nominal state propagation ──────────────────────────────────────
-        a_world = R @ f_corr + self._gravity         # true acceleration, world
+        a_world = R @ f_corr + self._gravity  # true acceleration, world
         self._p += self._v * dt + 0.5 * a_world * (dt * dt)
         self._v += a_world * dt
-        self._q  = _quat_mul(self._q, _exp_so3(w_corr * dt))
+        self._q = _quat_mul(self._q, _exp_so3(w_corr * dt))
         self._q /= np.linalg.norm(self._q)
         # b_a and b_g are unchanged by prediction (driven only by process noise)
 
@@ -434,20 +461,20 @@ class EskfNode(Node):
         # F = I + Fc·dt  where Fc contains the continuous-time Jacobians.
         F = np.eye(15, dtype=np.float64)
 
-        F[0:3, 3:6]   =  np.eye(3) * dt              # δṗ = δv
-        F[3:6, 6:9]   = -R @ _skew(f_corr) * dt      # δv̇ ← −R·[f×]·δθ
-        F[3:6, 9:12]  = -R * dt                       # δv̇ ← −R·δb_a
-        F[6:9, 6:9]   =  np.eye(3) - _skew(w_corr) * dt  # δθ̇ = −[ω×]·δθ
-        F[6:9, 12:15] = -np.eye(3) * dt               # δθ̇ ← −δb_g
+        F[0:3, 3:6] = np.eye(3) * dt  # δṗ = δv
+        F[3:6, 6:9] = -R @ _skew(f_corr) * dt  # δv̇ ← −R·[f×]·δθ
+        F[3:6, 9:12] = -R * dt  # δv̇ ← −R·δb_a
+        F[6:9, 6:9] = np.eye(3) - _skew(w_corr) * dt  # δθ̇ = −[ω×]·δθ
+        F[6:9, 12:15] = -np.eye(3) * dt  # δθ̇ ← −δb_g
 
         # ── Discrete process noise Qd (15×15) ─────────────────────────────
         #
         # Qd = Qc · dt  (first-order hold approximation)
         # Only non-zero blocks (position gets no direct noise):
         Q = np.zeros((15, 15), dtype=np.float64)
-        Q[3:6,   3:6]   = np.eye(3) * (self._sa2  * dt)  # accel noise → δv
-        Q[6:9,   6:9]   = np.eye(3) * (self._sg2  * dt)  # gyro  noise → δθ
-        Q[9:12,  9:12]  = np.eye(3) * (self._sba2 * dt)  # accel bias walk
+        Q[3:6, 3:6] = np.eye(3) * (self._sa2 * dt)  # accel noise → δv
+        Q[6:9, 6:9] = np.eye(3) * (self._sg2 * dt)  # gyro  noise → δθ
+        Q[9:12, 9:12] = np.eye(3) * (self._sba2 * dt)  # accel bias walk
         Q[12:15, 12:15] = np.eye(3) * (self._sbg2 * dt)  # gyro  bias walk
 
         # ── Covariance propagation ─────────────────────────────────────────
@@ -470,13 +497,13 @@ class EskfNode(Node):
           H[0:3, 0:3] = I₃   ∂p_meas/∂δp
           H[3:6, 6:9] = I₃   ∂θ_meas/∂δθ  (first-order, error in body frame)
         """
-        R_nom  = _quat_to_rot(self._q)
+        R_nom = _quat_to_rot(self._q)
         R_meas = _quat_to_rot(q_meas)
 
         # Innovation
         z_p = p_meas - self._p
-        z_r = _log_so3(R_nom.T @ R_meas)   # rotation error expressed in body frame
-        z   = np.concatenate([z_p, z_r])    # (6,)
+        z_r = _log_so3(R_nom.T @ R_meas)  # rotation error expressed in body frame
+        z = np.concatenate([z_p, z_r])  # (6,)
 
         # Measurement Jacobian
         H = np.zeros((6, 15), dtype=np.float64)
@@ -484,17 +511,17 @@ class EskfNode(Node):
         H[3:6, 6:9] = np.eye(3)
 
         # Innovation covariance and Kalman gain
-        S = H @ self._P @ H.T + self._R_meas    # (6×6)
-        K = self._P @ H.T @ np.linalg.solve(S.T, np.eye(6)).T   # (15×6)
+        S = H @ self._P @ H.T + self._R_meas  # (6×6)
+        K = self._P @ H.T @ np.linalg.solve(S.T, np.eye(6)).T  # (15×6)
 
         # Error-state estimate
-        dx = K @ z    # (15,)
+        dx = K @ z  # (15,)
 
         # Nominal state injection
-        self._p   += dx[0:3]
-        self._v   += dx[3:6]
-        self._q    = _quat_mul(self._q, _exp_so3(dx[6:9]))
-        self._q   /= np.linalg.norm(self._q)
+        self._p += dx[0:3]
+        self._v += dx[3:6]
+        self._q = _quat_mul(self._q, _exp_so3(dx[6:9]))
+        self._q /= np.linalg.norm(self._q)
         self._b_a += dx[9:12]
         self._b_g += dx[12:15]
 
@@ -507,7 +534,7 @@ class EskfNode(Node):
         self._P = (self._P + self._P.T) * 0.5
 
         self._update_count += 1
-        if self._update_count % 20 == 0:   # log every ~1 s
+        if self._update_count % 20 == 0:  # log every ~1 s
             self.get_logger().debug(
                 f"ESKF update #{self._update_count}: "
                 f"|z_p|={np.linalg.norm(z_p):.4f} m  "
@@ -523,13 +550,13 @@ class EskfNode(Node):
 
         # Odometry message
         odom = Odometry()
-        odom.header.stamp    = stamp
+        odom.header.stamp = stamp
         odom.header.frame_id = "map"
-        odom.child_frame_id  = "base_link"
+        odom.child_frame_id = "base_link"
 
-        odom.pose.pose.position.x    = self._p[0]
-        odom.pose.pose.position.y    = self._p[1]
-        odom.pose.pose.position.z    = self._p[2]
+        odom.pose.pose.position.x = self._p[0]
+        odom.pose.pose.position.y = self._p[1]
+        odom.pose.pose.position.z = self._p[2]
         odom.pose.pose.orientation.x = self._q[0]
         odom.pose.pose.orientation.y = self._q[1]
         odom.pose.pose.orientation.z = self._q[2]
@@ -544,7 +571,7 @@ class EskfNode(Node):
         # PoseStamped (convenience for RViz)
         pose = PoseStamped()
         pose.header = odom.header
-        pose.pose   = odom.pose.pose
+        pose.pose = odom.pose.pose
         self._pub_pose.publish(pose)
 
 
