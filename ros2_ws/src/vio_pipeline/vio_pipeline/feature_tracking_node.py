@@ -8,7 +8,7 @@ import numpy as np
 import cv2
 import yaml
 
-from vio_pipeline.feature_extraction import FeatureExtractor
+from vio_pipeline.feature_tracking_KLT import FeatureExtractor
 
 
 def stamp_to_ns(stamp):
@@ -22,26 +22,17 @@ class FeatureTrackingNode(Node):
 
         self.declare_parameter("config_path", "")
         self.declare_parameter("max_matches", 50)
-        self.declare_parameter("device", "")
         self.declare_parameter("circular_check_threshold", 2.0)
 
         config_path = self.get_parameter("config_path").value
         self.max_matches = self.get_parameter("max_matches").value
-        device_param = self.get_parameter("device").value
         self.circular_threshold = self.get_parameter("circular_check_threshold").value
 
         if config_path:
             self.load_config(config_path)
 
-        device_kwarg = {"device": device_param} if device_param else {}
-        self.extractor = FeatureExtractor(**device_kwarg)
-
-        if self.extractor.superpoint is None:
-            self.get_logger().fatal(
-                "SuperPoint/LightGlue models failed to load. "
-                "Install with: pip install lightglue"
-            )
-            raise RuntimeError("lightglue not installed")
+        self.extractor = FeatureExtractor()
+            
 
         # Previous-frame state for temporal matching
         self._prev_left_features = None

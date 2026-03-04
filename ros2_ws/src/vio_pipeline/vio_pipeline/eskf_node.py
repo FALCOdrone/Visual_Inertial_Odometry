@@ -83,7 +83,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
 
 import yaml
 
@@ -177,6 +177,18 @@ def _exp_so3(phi: np.ndarray) -> np.ndarray:
         [axis[0] * s, axis[1] * s, axis[2] * s, np.cos(angle * 0.5)],
         dtype=np.float64,
     )
+
+
+def _rot_to_rpy(R: np.ndarray):
+    """Rotation matrix → (roll, pitch, yaw) in degrees (ZYX / intrinsic XYZ)."""
+    pitch = np.arcsin(-R[2, 0])
+    if abs(np.cos(pitch)) > 1e-6:
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+    else:  # gimbal lock
+        roll = np.arctan2(-R[1, 2], R[1, 1])
+        yaw = 0.0
+    return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
 
 
 def _log_so3(R: np.ndarray) -> np.ndarray:
@@ -313,6 +325,7 @@ class EskfNode(Node):
         # ── Publishers ───────────────────────────────────────────────────────
         self._pub_odom = self.create_publisher(Odometry, "/eskf/odometry", qos_be)
         self._pub_pose = self.create_publisher(PoseStamped, "/eskf/pose", qos_be)
+        self._pub_rpy = self.create_publisher(Vector3Stamped, "/eskf/rpy", qos_be)
 
         # ── Subscribers ──────────────────────────────────────────────────────
         self.create_subscription(Imu, "/imu0", self._raw_imu_cb, qos_be)
@@ -573,6 +586,16 @@ class EskfNode(Node):
         pose.header = odom.header
         pose.pose = odom.pose.pose
         self._pub_pose.publish(pose)
+
+        # RPY in degrees (x=roll, y=pitch, z=yaw)
+        R = _quat_to_rot(self._q)
+        roll, pitch, yaw = _rot_to_rpy(R)
+        rpy = Vector3Stamped()
+        rpy.header = odom.header
+        rpy.vector.x = roll
+        rpy.vector.y = pitch
+        rpy.vector.z = yaw
+        self._pub_rpy.publish(rpy)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

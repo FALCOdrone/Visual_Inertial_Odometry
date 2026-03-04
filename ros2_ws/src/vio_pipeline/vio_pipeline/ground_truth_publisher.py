@@ -1,7 +1,7 @@
 import rclpy  # type: ignore
 from rclpy.node import Node  # type: ignore
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy  # type: ignore
-from geometry_msgs.msg import PoseStamped  # type: ignore
+from geometry_msgs.msg import PoseStamped, Vector3Stamped  # type: ignore
 from nav_msgs.msg import Path, Odometry  # type: ignore
 
 import numpy as np
@@ -23,6 +23,18 @@ def _quat_to_rot(q):
             [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
         ]
     )
+
+
+def _rot_to_rpy(R):
+    """Rotation matrix → (roll, pitch, yaw) in degrees (ZYX / intrinsic XYZ)."""
+    pitch = np.arcsin(-R[2, 0])
+    if abs(np.cos(pitch)) > 1e-6:
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        roll = np.arctan2(-R[1, 2], R[1, 1])
+        yaw = 0.0
+    return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
 
 
 def _rot_to_quat(R):
@@ -120,6 +132,7 @@ class GroundTruthPublisherNode(Node):
         self.pose_pub = self.create_publisher(PoseStamped, "/gt_pub/pose", 10)
         self.path_pub = self.create_publisher(Path, "/gt_pub/path", 10)
         self.odom_pub = self.create_publisher(Odometry, "/gt_pub/odometry", 10)
+        self.rpy_pub = self.create_publisher(Vector3Stamped, "/gt_pub/rpy", 10)
 
         self.path_msg = Path()
         self.path_msg.header.frame_id = "map"
@@ -184,6 +197,15 @@ class GroundTruthPublisherNode(Node):
         odom_msg.child_frame_id = "base_link"
         odom_msg.pose.pose = pose_msg.pose
         self.odom_pub.publish(odom_msg)
+
+        roll, pitch, yaw = _rot_to_rpy(R)
+        rpy_msg = Vector3Stamped()
+        rpy_msg.header.stamp = stamp
+        rpy_msg.header.frame_id = "map"
+        rpy_msg.vector.x = roll
+        rpy_msg.vector.y = pitch
+        rpy_msg.vector.z = yaw
+        self.rpy_pub.publish(rpy_msg)
 
         self.get_logger().debug(f"gt pos=({t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f})")
 

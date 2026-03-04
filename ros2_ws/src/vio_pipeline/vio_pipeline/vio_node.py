@@ -3,14 +3,14 @@ from rclpy.node import Node  # type: ignore
 from sensor_msgs.msg import Image  # type: ignore
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy  # type: ignore
 from message_filters import Subscriber, ApproximateTimeSynchronizer  # type: ignore
-from geometry_msgs.msg import PoseStamped  # type: ignore
+from geometry_msgs.msg import PoseStamped, Vector3Stamped  # type: ignore
 from nav_msgs.msg import Path, Odometry  # type: ignore
 
 import numpy as np
 import cv2
 import yaml
 
-from vio_pipeline.feature_extraction import FeatureExtractor
+from vio_pipeline.feature_tracking_KLT import FeatureExtractor
 
 
 def stamp_to_ns(stamp):
@@ -48,12 +48,23 @@ def _rot_to_quat(R):
     return np.array([x, y, z, w])
 
 
+def _rot_to_rpy(R):
+    """Rotation matrix → (roll, pitch, yaw) in degrees (ZYX / intrinsic XYZ)."""
+    pitch = np.arcsin(-R[2, 0])
+    if abs(np.cos(pitch)) > 1e-6:
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        roll = np.arctan2(-R[1, 2], R[1, 1])
+        yaw = 0.0
+    return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+
+
 class PoseEstimationNode(Node):
     def __init__(self):
         super().__init__("pose_estimation_node")
 
         self.declare_parameter("config_path", "")
-        self.declare_parameter("device", "")
         self.declare_parameter("min_tracks", 10)
         self.declare_parameter("circular_check_threshold", 2.0)
         self.declare_parameter("max_depth", 30.0)          # metres — discard far points
@@ -62,7 +73,6 @@ class PoseEstimationNode(Node):
         self.declare_parameter("max_rotation_deg", 30.0)   # degrees per frame
 
         config_path = self.get_parameter("config_path").value
-        device_param = self.get_parameter("device").value
         self.min_tracks = self.get_parameter("min_tracks").value
         self.circular_threshold = self.get_parameter("circular_check_threshold").value
         self.max_depth = self.get_parameter("max_depth").value
@@ -73,15 +83,7 @@ class PoseEstimationNode(Node):
         self.load_config(config_path)
         self._setup_camera_params()
 
-        device_kwarg = {"device": device_param} if device_param else {}
-        self.extractor = FeatureExtractor(**device_kwarg)
-
-        if self.extractor.superpoint is None:
-            self.get_logger().fatal(
-                "SuperPoint/LightGlue models failed to load. "
-                "Install with: pip install lightglue"
-            )
-            raise RuntimeError("lightglue not installed")
+        self.extractor = FeatureExtractor()
 
         # Feature tracking state
         self._prev_left_features = None
@@ -156,8 +158,21 @@ class PoseEstimationNode(Node):
         self.pose_pub = self.create_publisher(PoseStamped, "/vio/pose", 10)
         self.path_pub = self.create_publisher(Path, "/vio/path", 10)
         self.odom_pub = self.create_publisher(Odometry, "/vio/odometry", 10)
+        self.rpy_pub = self.create_publisher(Vector3Stamped, "/vio/rpy", 10)
+        self.temporal_viz_pub = self.create_publisher(Image, "/features/temporal_viz", 10)
 
         self.get_logger().info("ROS topics initialized")
+
+    def _numpy_bgr_to_image_msg(self, img, stamp, frame_id="cam0"):
+        """Convert a BGR numpy image to sensor_msgs/Image."""
+        msg = Image()
+        msg.header.stamp = stamp
+        msg.header.frame_id = frame_id
+        msg.height, msg.width = img.shape[:2]
+        msg.encoding = "bgr8"
+        msg.step = msg.width * 3
+        msg.data = img.tobytes()
+        return msg
 
     def _image_msg_to_numpy(self, msg):
         """Convert sensor_msgs/Image to a grayscale numpy array."""
@@ -192,6 +207,13 @@ class PoseEstimationNode(Node):
         self._prev_right_features = result["right_features"]
 
         tracks = result["circular_tracks"]
+
+        t_vis = self.extractor.visualize_temporal_tracks(left_img, tracks)
+        if t_vis is not None:
+            self.temporal_viz_pub.publish(
+                self._numpy_bgr_to_image_msg(t_vis, stamp)
+            )
+
         if tracks is None:
             self.get_logger().info(f"ts={ts_ns} | first frame — no pose update")
             return
@@ -359,6 +381,15 @@ class PoseEstimationNode(Node):
         odom_msg.child_frame_id = "base_link"
         odom_msg.pose.pose = pose_msg.pose
         self.odom_pub.publish(odom_msg)
+
+        roll, pitch, yaw = _rot_to_rpy(R)
+        rpy_msg = Vector3Stamped()
+        rpy_msg.header.stamp = stamp
+        rpy_msg.header.frame_id = "map"
+        rpy_msg.vector.x = roll
+        rpy_msg.vector.y = pitch
+        rpy_msg.vector.z = yaw
+        self.rpy_pub.publish(rpy_msg)
 
         self.get_logger().info(f"ts={ts_ns} | pos=({t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f})")
 

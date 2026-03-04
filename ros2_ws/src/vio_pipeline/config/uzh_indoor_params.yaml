@@ -1,0 +1,38 @@
+cam0:
+  intrinsics: [278.66723066149086, 278.48991409740296, 319.75221200593535, 241.96858910358173]  # fx fy cx cy
+  distortion: [0.0, 0.0, 0.0, 0.0]  # images pre-undistorted with fisheye model at bag creation
+  resolution: [640, 480]
+  rate_hz: 30
+  # T_BS: T_body_cam0 (p_body = T_BS @ p_cam) — derived from Kalibr T_cam_imu via inversion
+  T_BS: [-0.028228787368606065, 0.014401251861751119, 0.9994977436235219, 0.0011021205742629516,
+         -0.9996014883019430, -0.00041887083271475100, -0.028225682131089447, 0.021701418709802076,
+          1.2175294828519900e-05, -0.9998962088597194, 0.014407337010089172, -5.927888231516880e-05,
+          0.0, 0.0, 0.0, 1.0]
+
+cam1:
+  intrinsics: [277.61640629770613, 277.63749695723294, 314.8944703346039, 236.04310050462587]  # fx fy cx cy
+  distortion: [0.0, 0.0, 0.0, 0.0]  # images pre-undistorted with fisheye model at bag creation
+  resolution: [640, 480]
+  rate_hz: 30
+  # T_BS: T_body_cam1 (p_body = T_BS @ p_cam) — derived from Kalibr T_cam_imu via inversion
+  T_BS: [-0.011823057800830705, 0.011552991631909482, 0.9998633625093960, -0.00029027518590631160,
+         -0.9998701444077991, 0.010813766814320780, -0.011948086424720228, -0.057906947234433570,
+         -0.010950325390841398, -0.9998747875767439, 0.011423639621249038, -0.00019190292359253430,
+          0.0, 0.0, 0.0, 1.0]
+
+# Stereo baseline (metres) — norm of translation between cam0 and cam1 optical centres
+stereo_baseline: 0.07962
+
+imu:
+  gyro_noise:  0.05          # rad/s/sqrt(Hz)
+  gyro_walk:   4.0e-05       # rad/s^2/sqrt(Hz)
+  accel_noise: 0.1           # m/s^2/sqrt(Hz)
+  accel_walk:  0.002         # m/s^3/sqrt(Hz)
+  rate_hz: 500
+  # T_BS (IMU w.r.t. body) — identity (IMU frame = body frame)
+  T_BS: [1.0, 0.0, 0.0, 0.0,
+         0.0, 1.0, 0.0, 0.0,
+         0.0, 0.0, 1.0, 0.0,
+         0.0, 0.0, 0.0, 1.0]
+
+gravity: [0.0, 0.0, -9.81]
