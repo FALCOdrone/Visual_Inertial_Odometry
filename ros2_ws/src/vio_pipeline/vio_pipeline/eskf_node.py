@@ -228,18 +228,36 @@ class EskfNode(Node):
 
         # ── Parameters ──────────────────────────────────────────────────────
         self.declare_parameter("config_path", "")
-        self.declare_parameter("meas_pos_std", 0.05)  # m
-        self.declare_parameter("meas_ang_std", 0.02)  # rad
+        # Measurement noise: how much to trust VIO vs IMU
+        self.declare_parameter("meas_pos_std", 0.05)   # m
+        self.declare_parameter("meas_ang_std", 0.02)   # rad
+        # Initial error-state covariance diagonal (seeds P at startup)
+        self.declare_parameter("init_pos_std", 1.0)    # m
+        self.declare_parameter("init_vel_std", 1.0)    # m/s
+        self.declare_parameter("init_att_std", 0.1)    # rad
+        self.declare_parameter("init_ba_std", 0.01)    # m/s²
+        self.declare_parameter("init_bg_std", 0.001)   # rad/s
+        # Max IMU dt before the sample is discarded as a time jump
+        self.declare_parameter("max_dt", 0.1)          # s
+
+        config_path    = self.get_parameter("config_path").value
+        meas_pos_std   = float(self.get_parameter("meas_pos_std").value)
+        meas_ang_std   = float(self.get_parameter("meas_ang_std").value)
+        init_pos_std   = float(self.get_parameter("init_pos_std").value)
+        init_vel_std   = float(self.get_parameter("init_vel_std").value)
+        init_att_std   = float(self.get_parameter("init_att_std").value)
+        init_ba_std    = float(self.get_parameter("init_ba_std").value)
+        init_bg_std    = float(self.get_parameter("init_bg_std").value)
+        self._max_dt   = float(self.get_parameter("max_dt").value)
+
         self.get_logger().info(
-            "ESKF node parameters: pos_std=%.3f, ang_std=%.3f"
-            % (
-                self.get_parameter("meas_pos_std").value,
-                self.get_parameter("meas_ang_std").value,
-            )
+            "ESKF params: meas_pos_std=%.3f m  meas_ang_std=%.4f rad  "
+            "init_pos=%.2f m  init_vel=%.2f m/s  init_att=%.4f rad  "
+            "init_ba=%.4f  init_bg=%.5f  max_dt=%.2f s"
+            % (meas_pos_std, meas_ang_std,
+               init_pos_std, init_vel_std, init_att_std,
+               init_ba_std, init_bg_std, self._max_dt)
         )
-        config_path = self.get_parameter("config_path").value
-        meas_pos_std = float(self.get_parameter("meas_pos_std").value)
-        meas_ang_std = float(self.get_parameter("meas_ang_std").value)
 
         # ── IMU noise figures (EuRoC defaults, overridden by YAML) ───────────
         self._gravity = np.array([0.0, 0.0, -9.81], dtype=np.float64)
@@ -290,15 +308,15 @@ class EskfNode(Node):
         self._b_g = np.zeros(3, dtype=np.float64)  # residual gyro  bias
 
         # ── Error-state covariance P (15×15) ────────────────────────────────
-        # Seeded with generous uncertainty; will contract after first VIO update.
+        # Seeded from launch parameters; will contract after first VIO update.
         self._P = np.diag(
             np.concatenate(
                 [
-                    np.full(3, 1.0),  # δp  [m²]
-                    np.full(3, 1.0),  # δv  [m²/s²]
-                    np.full(3, 1e-2),  # δθ  [rad²]
-                    np.full(3, 1e-4),  # δb_a [m²/s⁴]
-                    np.full(3, 1e-6),  # δb_g [rad²/s²]
+                    np.full(3, init_pos_std**2),   # δp  [m²]
+                    np.full(3, init_vel_std**2),   # δv  [m²/s²]
+                    np.full(3, init_att_std**2),   # δθ  [rad²]
+                    np.full(3, init_ba_std**2),    # δb_a [m²/s⁴]
+                    np.full(3, init_bg_std**2),    # δb_g [rad²/s²]
                 ]
             )
         ).astype(np.float64)
@@ -363,7 +381,7 @@ class EskfNode(Node):
         dt = (stamp_ns - self._last_stamp_ns) * 1e-9
         self._last_stamp_ns = stamp_ns
 
-        if dt <= 0.0 or dt > 0.1:
+        if dt <= 0.0 or dt > self._max_dt:
             return
 
         gyro = np.array(

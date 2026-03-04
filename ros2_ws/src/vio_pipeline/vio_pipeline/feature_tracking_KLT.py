@@ -29,7 +29,7 @@ class FeatureExtractor:
         min_distance: int = 20,       # minimum pixel gap between any two detected corners; (prev 10)
                                       #   larger → more spatially spread-out features (better
                                       #   for geometry), smaller → corners can cluster together
-        win_size: tuple = (21, 21),   # KLT patch size searched at each pyramid level; larger (prev 21,21)
+        win_size: tuple = (14, 14),   # KLT patch size searched at each pyramid level; larger (prev 21,21)
                                       #   handles faster motion but is slower and can drift on
                                       #   low-texture regions; smaller is faster but loses tracks
                                       #   under large inter-frame displacement
