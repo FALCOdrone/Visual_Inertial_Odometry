@@ -162,9 +162,13 @@ class GroundTruthPublisherNode(Node):
         T_vicon_body = _pose_msg_to_matrix(msg.pose)
 
         if self._T_align is None:
-            # World frame = initial body frame (same convention as odometry).
-            # Strip only the initial body pose → both GT and odom start at identity.
-            self._T_align = np.linalg.inv(T_vicon_body)
+            # World frame = ROS z-up (same convention as odometry).
+            # Same body→ROS correction as vio_node: EuRoC body x≈up, z≈fwd.
+            _T_body_to_ros = np.array([[0, 0, 1, 0],
+                                       [0,-1, 0, 0],
+                                       [1, 0, 0, 0],
+                                       [0, 0, 0, 1]], dtype=np.float64)
+            self._T_align = _T_body_to_ros @ np.linalg.inv(T_vicon_body)
             self.get_logger().info("Ground truth alignment initialised")
 
         T_world_body = self._T_align @ T_vicon_body

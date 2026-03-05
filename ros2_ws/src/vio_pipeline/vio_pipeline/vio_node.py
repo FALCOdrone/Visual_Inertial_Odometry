@@ -89,10 +89,18 @@ class PoseEstimationNode(Node):
         self._prev_left_features = None
         self._prev_right_features = None
 
-        # World frame = initial body frame (FLU: x-fwd, y-left, z-up at t=0).
-        # Initialising with T_b_c0 ensures T_world_body_0 = T_b_c0 @ inv(T_b_c0) = I,
-        # so the body starts at the origin with identity orientation.
-        self.T_world_cam0 = self.T_b_c0.copy()
+        # World frame = ROS z-up convention (x-fwd, y-left, z-up).
+        # The EuRoC body/IMU frame has x≈up, y≈right, z≈fwd (R_b_c0 ≈ R_z(90°)),
+        # so a fixed correction rotates the initial world frame so that altitude
+        # appears on z and the ESKF gravity vector [0, 0, -9.81] is correct.
+        #   body-x (up)    → new z
+        #   body-y (right) → new -y  (new y = left)
+        #   body-z (fwd)   → new x
+        _T_body_to_ros = np.array([[0, 0, 1, 0],
+                                   [0,-1, 0, 0],
+                                   [1, 0, 0, 0],
+                                   [0, 0, 0, 1]], dtype=np.float64)
+        self.T_world_cam0 = _T_body_to_ros @ self.T_b_c0
 
         self.path_msg = Path()
         self.path_msg.header.frame_id = "map"
