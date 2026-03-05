@@ -30,6 +30,7 @@ setup(
             "eskf_node = vio_pipeline.eskf_node:main",
             "debug_logger_node = vio_pipeline.debug_logger_node:main",
             "tf_publisher_node = vio_pipeline.tf_publisher_node:main",
+            "fgo_backend = vio_pipeline.fgo_backend_node:main",
         ],
     },
 )
