@@ -1,0 +1,106 @@
+# gps_profiles.yaml
+# ══════════════════════════════════════════════════════════════════════════════
+# GPS receiver simulation profiles for the VIO pipeline.
+# Source: Septentrio mosaic-G5 P3 & P3H datasheet (MS 5/2025).
+#         Accuracy figures are open-sky RMS values (footnotes 2-3).
+#         Baseline constraint for RTK: < 40 km (footnote 4).
+#
+# Each profile has two sections:
+#   simulator   — noise injected by gps_simulator_node
+#   eskf        — measurement noise assumed by the ESKF fusion filter
+#
+# Select a profile at launch time:
+#   ros2 launch vio_pipeline full_pipeline.launch.py gps_mode:=standalone
+#   ros2 launch vio_pipeline full_pipeline.launch.py gps_mode:=rtk
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Standalone (autonomous GNSS, no corrections) ─────────────────────────────
+# Datasheet: H = 1.2 m RMS,  V = 1.9 m RMS  (open sky, footnote 2-3)
+# Realistic for typical UAV deployments without a base station.
+standalone:
+
+  simulator:
+    # White-noise position error (1-σ, matched to datasheet RMS)
+    noise_h_m:          1.2     # horizontal 1-σ [m]  (datasheet: 1.2 m RMS)
+    noise_v_m:          1.9     # vertical   1-σ [m]  (datasheet: 1.9 m RMS)
+
+    # Gauss-Markov bias drift: b_dot = -b/τ + q·ξ
+    bias_time_const_s:  120.0   # correlation time τ [s]  — moderate TCXO stability
+    bias_walk_h_m_s:    0.04    # horizontal bias random walk [m/√s]
+    bias_walk_v_m_s:    0.06    # vertical   bias random walk [m/√s]
+
+    # Multipath (APME+ a-posteriori multipath estimator reduces residuals)
+    multipath_prob:     0.005   # per-sample probability of a multipath event
+    multipath_scale:    2.0     # residual multipath magnitude [× noise_h_m]
+
+    # Signal outages (LOCK+ mechanical robustness; re-acquisition 1 s datasheet)
+    outage_prob_per_s:  0.003   # Poisson rate [1/s]  ≈ 1 outage per ~5 min
+    outage_duration_s:  1.0     # mean outage length [s]  (datasheet re-acquisition)
+
+    # Update rate — mosaic-G5 maximum position output rate
+    update_rate_hz:     20.0    # [Hz]  (datasheet: 20 Hz max)
+
+    # WGS-84 reference origin for ENU ↔ LLA conversion (EuRoC Vicon room, Zurich)
+    ref_lat_deg:        47.3977419
+    ref_lon_deg:         8.5455938
+    ref_alt_m:         486.0
+
+  eskf:
+    # Inflate slightly above simulator noise to absorb residual Gauss-Markov bias.
+    # With VIO meas_pos_std ≈ 0.05 m, filter trusts VIO ~30× more than GPS
+    # on any single measurement, but GPS prevents long-term position drift.
+    pos_std_h:          1.5     # horizontal 1-σ [m]  (≥ noise_h + bias margin)
+    pos_std_v:          2.5     # vertical   1-σ [m]  (≥ noise_v + bias margin)
+
+    # Innovation gate: χ²(3 DOF).  Rejects multipath spikes and outage fixes.
+    #   χ²(3, 0.95) = 7.815   → accepts 95 % of honest innovations
+    #   χ²(3, 0.99) = 11.345  → more permissive
+    #   0 = disabled
+    gate_chi2:          7.815   # χ²(3, 0.95)  — tight enough to reject multipath
+
+
+# ── RTK (Real-Time Kinematic, base station required, baseline < 40 km) ───────
+# Datasheet: H = 0.6 cm + 0.5 ppm RMS,  V = 1 cm + 1 ppm RMS
+#            Initialisation time: 7 s
+# At 500 m baseline: H ≈ 0.006 + 0.00025 = 0.0063 m,  V ≈ 0.010 + 0.0005 = 0.0105 m
+# Rounded conservatively to 1 cm / 2 cm for simulation.
+rtk:
+
+  simulator:
+    # White-noise position error
+    noise_h_m:          0.010   # ~1 cm horizontal 1-σ (500 m baseline)
+    noise_v_m:          0.020   # ~2 cm vertical   1-σ
+
+    # Bias drift — RTK carrier-phase resolves most biases; very slow residual
+    bias_time_const_s:  600.0   # long τ: carrier-phase nearly bias-free
+    bias_walk_h_m_s:    0.001   # near-zero horizontal bias walk [m/√s]
+    bias_walk_v_m_s:    0.002   # near-zero vertical   bias walk [m/√s]
+
+    # Multipath — carrier phase + APME+ strongly suppresses multipath
+    multipath_prob:     0.002   # rare: carrier-phase multipath is cm-level
+    multipath_scale:    1.5     # small residual [× noise_h_m]
+
+    # Outages — cycle slips; re-initialisation takes full 7 s (datasheet)
+    outage_prob_per_s:  0.001   # rare with LOCK+ vibration robustness
+    outage_duration_s:  7.0     # RTK re-init time [s]  (datasheet)
+
+    # Update rate (same hardware, same max rate)
+    update_rate_hz:     20.0    # [Hz]
+
+    # WGS-84 reference origin (same as standalone)
+    ref_lat_deg:        47.3977419
+    ref_lon_deg:         8.5455938
+    ref_alt_m:         486.0
+
+  eskf:
+    # RTK is cm-accurate → R_gps << P_pp (≈ meas_pos_std² = 0.0025 m²).
+    # Kalman weight on GPS ≈ P_pp / (P_pp + R_gps) ≈ 92 % → GPS dominates position.
+    pos_std_h:          0.015   # [m]  slight margin above 1 cm RTK noise
+    pos_std_v:          0.030   # [m]
+
+    # Gate DISABLED for RTK.
+    # Reason: P_pp converges to ~0.0025 m² after VIO updates, making S ≈ 0.0027 m².
+    # Any VIO drift > ~8 cm causes NIS > 7.815 and would block every valid RTK
+    # correction.  RTK is inherently reliable (APME+ + LOCK+ + carrier phase);
+    # no outlier gate is needed.
+    gate_chi2:          0.0     # 0 = disabled — always accept RTK fixes

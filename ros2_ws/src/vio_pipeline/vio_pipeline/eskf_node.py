@@ -5,7 +5,8 @@ eskf_node.py
 Error-State Kalman Filter (ESKF) for Visual-Inertial Odometry.
 
 Fuses bias-corrected IMU measurements (200 Hz) with visual odometry pose
-updates (20 Hz) to produce globally-consistent pose and velocity estimates.
+updates (20 Hz) and optional GPS position updates (~5 Hz) to produce
+globally-consistent pose and velocity estimates.
 
 Error-state vector  δx ∈ ℝ¹⁵
 -------------------------------
@@ -14,19 +15,35 @@ Error-state vector  δx ∈ ℝ¹⁵
 
 Subscriptions
 -------------
-  /imu/processed   sensor_msgs/Imu      bias-corrected + filtered @ 200 Hz
-  /vio/odometry    nav_msgs/Odometry    visual 6-DOF pose @ 20 Hz
+  /imu/processed   sensor_msgs/Imu           bias-corrected + filtered @ 200 Hz
+  /vio/odometry    nav_msgs/Odometry         visual 6-DOF pose @ 20 Hz
+  /gps/enu         geometry_msgs/PointStamped GPS position in ENU/map frame (~5 Hz)
 
 Publications
 ------------
-  /eskf/odometry   nav_msgs/Odometry    fused pose + velocity (map frame)
-  /eskf/pose       geometry_msgs/PoseStamped   convenience pose
+  /eskf/odometry   nav_msgs/Odometry         fused pose + velocity (map frame)
+  /eskf/pose       geometry_msgs/PoseStamped convenience pose
 
 Parameters
 ----------
-  config_path    str    path to euroc_params.yaml (IMU noise figures)
-  meas_pos_std   float  VIO position noise std-dev  [m]      (default 0.05)
-  meas_ang_std   float  VIO rotation noise std-dev  [rad]    (default 0.02)
+  config_path      str    path to euroc_params.yaml (IMU noise figures)
+  meas_pos_std     float  VIO position noise std-dev  [m]      (default 0.05)
+  meas_ang_std     float  VIO rotation noise std-dev  [rad]    (default 0.02)
+  use_gps          bool   enable GPS position updates          (default true)
+  gps_pos_std_h    float  GPS horizontal position 1-σ [m]      (default 2.0)
+  gps_pos_std_v    float  GPS vertical position 1-σ   [m]      (default 4.0)
+  gps_gate_chi2    float  Mahalanobis gate threshold (χ² 3-DOF, 0=off) (default 7.815)
+
+GPS update (every NavSatFix, dt ≈ 200 ms)
+  Innovation:
+    z = p_gps_enu − p_nom   ∈ ℝ³
+
+  Measurement Jacobian H_gps (3×15):
+    H[0:3, 0:3] = I₃   (position only)
+
+  Innovation gate (Mahalanobis):
+    ε = zᵀ·S⁻¹·z  — sample discarded if ε > gps_gate_chi2
+    (χ²(3, 0.95)=7.815  χ²(3, 0.99)=11.34)
 
 Theory notes
 ------------
@@ -83,7 +100,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from geometry_msgs.msg import PoseStamped, PointStamped, Vector3Stamped
 
 import yaml
 
@@ -239,6 +256,11 @@ class EskfNode(Node):
         self.declare_parameter("init_bg_std", 0.001)   # rad/s
         # Max IMU dt before the sample is discarded as a time jump
         self.declare_parameter("max_dt", 0.1)          # s
+        # GPS fusion
+        self.declare_parameter("use_gps",       True)
+        self.declare_parameter("gps_pos_std_h", 2.0)   # m  horizontal 1-σ
+        self.declare_parameter("gps_pos_std_v", 4.0)   # m  vertical   1-σ
+        self.declare_parameter("gps_gate_chi2", 7.815) # χ²(3, 0.95)
 
         config_path    = self.get_parameter("config_path").value
         meas_pos_std   = float(self.get_parameter("meas_pos_std").value)
@@ -248,15 +270,21 @@ class EskfNode(Node):
         init_att_std   = float(self.get_parameter("init_att_std").value)
         init_ba_std    = float(self.get_parameter("init_ba_std").value)
         init_bg_std    = float(self.get_parameter("init_bg_std").value)
-        self._max_dt   = float(self.get_parameter("max_dt").value)
+        self._max_dt      = float(self.get_parameter("max_dt").value)
+        self._use_gps     = bool(self.get_parameter("use_gps").value)
+        gps_pos_std_h     = float(self.get_parameter("gps_pos_std_h").value)
+        gps_pos_std_v     = float(self.get_parameter("gps_pos_std_v").value)
+        self._gps_gate    = float(self.get_parameter("gps_gate_chi2").value)
 
         self.get_logger().info(
             "ESKF params: meas_pos_std=%.3f m  meas_ang_std=%.4f rad  "
             "init_pos=%.2f m  init_vel=%.2f m/s  init_att=%.4f rad  "
-            "init_ba=%.4f  init_bg=%.5f  max_dt=%.2f s"
+            "init_ba=%.4f  init_bg=%.5f  max_dt=%.2f s  "
+            "use_gps=%s  gps_h=%.2f m  gps_v=%.2f m  gate=%.3f"
             % (meas_pos_std, meas_ang_std,
                init_pos_std, init_vel_std, init_att_std,
-               init_ba_std, init_bg_std, self._max_dt)
+               init_ba_std, init_bg_std, self._max_dt,
+               self._use_gps, gps_pos_std_h, gps_pos_std_v, self._gps_gate)
         )
 
         # ── IMU noise figures (EuRoC defaults, overridden by YAML) ───────────
@@ -290,7 +318,7 @@ class EskfNode(Node):
         self._sba2 = sigma_ba**2
         self._sbg2 = sigma_bg**2
 
-        # ── Measurement noise R (6×6) ────────────────────────────────────────
+        # ── Measurement noise: VIO (6×6) ────────────────────────────────────
         self._R_meas = np.diag(
             np.concatenate(
                 [
@@ -299,6 +327,9 @@ class EskfNode(Node):
                 ]
             )
         )
+
+        # ── Measurement noise: GPS (3×3) ─────────────────────────────────────
+        self._R_gps = np.diag([gps_pos_std_h**2, gps_pos_std_h**2, gps_pos_std_v**2])
 
         # ── Nominal state ────────────────────────────────────────────────────
         self._p = np.zeros(3, dtype=np.float64)  # position  (world)
@@ -352,9 +383,17 @@ class EskfNode(Node):
         self.create_subscription(Imu, "/imu0", self._raw_imu_cb, qos_be)
         self.create_subscription(Imu, "/imu/processed", self._imu_cb, qos_be)
         self.create_subscription(Odometry, "/vio/odometry", self._vio_cb, 10)
+        if self._use_gps:
+            self.create_subscription(
+                PointStamped, "/gps/enu", self._gps_cb, qos_be
+            )
+
+        self._gps_update_count  = 0
+        self._gps_reject_count  = 0
 
         self.get_logger().info(
-            "EskfNode ready — waiting for first VIO measurement to initialise."
+            "EskfNode ready — waiting for first VIO measurement to initialise. "
+            f"GPS fusion: {'ON' if self._use_gps else 'OFF'}"
         )
 
     # ── Raw IMU gravity buffer ──────────────────────────────────────────────────
@@ -463,6 +502,78 @@ class EskfNode(Node):
             return
 
         self._update(p_meas, q_meas)
+
+    # ── GPS update ─────────────────────────────────────────────────────────────
+
+    def _gps_cb(self, msg: PointStamped) -> None:
+        if self._state != self._RUNNING:
+            return
+        p_gps = np.array([msg.point.x, msg.point.y, msg.point.z], dtype=np.float64)
+        self._update_gps(p_gps)
+
+    def _update_gps(self, p_gps: np.ndarray) -> None:
+        """
+        GPS position-only measurement update (Joseph-form EKF update).
+
+        Innovation
+        ----------
+          z = p_gps − p_nom   ∈ ℝ³
+
+        Measurement Jacobian H_gps (3×15)
+        ----------------------------------
+          H[0:3, 0:3] = I₃   (position rows only)
+
+        Innovation gate
+        ---------------
+          NIS ε = zᵀ·S⁻¹·z  (Normalised Innovation Squared)
+          Sample is rejected if ε > gps_gate_chi2.
+          This suppresses multipath spikes and outage fixes that would
+          otherwise corrupt the velocity and attitude states.
+        """
+        z = p_gps - self._p  # (3,)
+
+        # H_gps: position rows of the full 15-state Jacobian
+        H = np.zeros((3, 15), dtype=np.float64)
+        H[0:3, 0:3] = np.eye(3)
+
+        S = H @ self._P @ H.T + self._R_gps  # (3×3)
+
+        # Innovation gate
+        if self._gps_gate > 0.0:
+            nis = float(z @ np.linalg.solve(S, z))
+            if nis > self._gps_gate:
+                self._gps_reject_count += 1
+                self.get_logger().debug(
+                    f"GPS update rejected: NIS={nis:.2f} > gate={self._gps_gate:.2f} "
+                    f"(|z|={np.linalg.norm(z):.2f} m, "
+                    f"total rejected={self._gps_reject_count})"
+                )
+                return
+
+        K = self._P @ H.T @ np.linalg.solve(S.T, np.eye(3)).T  # (15×3)
+        dx = K @ z  # (15,)
+
+        # Nominal state injection (position + velocity; attitude left to VIO)
+        self._p   += dx[0:3]
+        self._v   += dx[3:6]
+        self._q    = _quat_mul(self._q, _exp_so3(dx[6:9]))
+        self._q   /= np.linalg.norm(self._q)
+        self._b_a += dx[9:12]
+        self._b_g += dx[12:15]
+
+        # Joseph-form covariance update
+        IKH = np.eye(15) - K @ H
+        self._P = IKH @ self._P @ IKH.T + K @ self._R_gps @ K.T
+        self._P = (self._P + self._P.T) * 0.5
+
+        self._gps_update_count += 1
+        if self._gps_update_count % 10 == 0:  # log every ~2 s at 5 Hz
+            self.get_logger().debug(
+                f"GPS update #{self._gps_update_count}: "
+                f"z=({z[0]:.2f}, {z[1]:.2f}, {z[2]:.2f}) m  "
+                f"|z|={np.linalg.norm(z):.2f} m  "
+                f"rejected={self._gps_reject_count}"
+            )
 
     # ── Prediction step ────────────────────────────────────────────────────────
 
