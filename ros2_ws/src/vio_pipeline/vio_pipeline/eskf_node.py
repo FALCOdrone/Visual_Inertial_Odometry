@@ -82,7 +82,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Imu
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 
 import yaml
@@ -344,6 +344,9 @@ class EskfNode(Node):
         self._pub_odom = self.create_publisher(Odometry, "/eskf/odometry", qos_be)
         self._pub_pose = self.create_publisher(PoseStamped, "/eskf/pose", qos_be)
         self._pub_rpy = self.create_publisher(Vector3Stamped, "/eskf/rpy", qos_be)
+        self._pub_path = self.create_publisher(Path, "/eskf/path", qos_be)
+        self._path_msg = Path()
+        self._path_msg.header.frame_id = "map"
 
         # ── Subscribers ──────────────────────────────────────────────────────
         self.create_subscription(Imu, "/imu0", self._raw_imu_cb, qos_be)
@@ -614,6 +617,11 @@ class EskfNode(Node):
         rpy.vector.y = pitch
         rpy.vector.z = yaw
         self._pub_rpy.publish(rpy)
+
+        # Path (append every IMU-rate pose, publish accumulated trajectory)
+        self._path_msg.header.stamp = stamp
+        self._path_msg.poses.append(pose)
+        self._pub_path.publish(self._path_msg)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
