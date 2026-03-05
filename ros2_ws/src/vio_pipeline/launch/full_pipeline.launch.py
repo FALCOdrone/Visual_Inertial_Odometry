@@ -24,9 +24,13 @@ from ament_index_python.packages import get_package_share_directory
 
 
 def _make_nodes(context, *args, **kwargs):
-    config_file = LaunchConfiguration("config_file").perform(context)
+    config_file  = LaunchConfiguration("config_file").perform(context)
     use_sim_time = LaunchConfiguration("use_sim_time").perform(context)
+    use_tf       = LaunchConfiguration("use_tf_publisher").perform(context)
+    use_gps      = LaunchConfiguration("use_gps_simulator").perform(context)
     use_sim_time_bool = use_sim_time.lower() in ("true", "1", "yes")
+    use_tf_bool       = use_tf.lower()  in ("true", "1", "yes")
+    use_gps_bool      = use_gps.lower() in ("true", "1", "yes")
 
     with open(config_file, "r") as f:
         cfg = yaml.safe_load(f)
@@ -148,8 +152,8 @@ def _make_nodes(context, *args, **kwargs):
                 }
             ],
         ),
-        # TF Publisher
-        Node(
+        # TF Publisher (use_tf_publisher:=true to enable)
+        *([Node(
             package="vio_pipeline",
             executable="tf_publisher_node",
             name="tf_publisher_node",
@@ -160,7 +164,40 @@ def _make_nodes(context, *args, **kwargs):
                     "use_sim_time": use_sim_time_bool,
                 }
             ],
-        ),
+        )] if use_tf_bool else []),
+        # GPS Simulator (use_gps_simulator:=true to enable)
+        *([Node(
+            package="vio_pipeline",
+            executable="gps_simulator_node",
+            name="gps_simulator_node",
+            output="screen",
+            parameters=[
+                {
+                    "use_sim_time": use_sim_time_bool,
+                    # GPS update rate
+                    "update_rate_hz":    5.0,
+                    # WGS-84 reference origin (EuRoC Vicon room, Zurich)
+                    "ref_lat_deg":       47.3977419,
+                    "ref_lon_deg":        8.5455938,
+                    "ref_alt_m":        486.0,
+                    # Position noise
+                    "noise_h_m":          1.0,   # horizontal 1-σ (m)
+                    "noise_v_m":          2.0,   # vertical   1-σ (m)
+                    # Gauss-Markov bias
+                    "bias_time_const_s": 60.0,  # correlation time constant (s)
+                    "bias_walk_h_m_s":    0.1,  # horizontal bias walk 1-σ (m/s^0.5)
+                    "bias_walk_v_m_s":    0.15, # vertical bias walk 1-σ (m/s^0.5)
+                    # Multipath
+                    "multipath_prob":     0.01,  # probability of multipath error
+                    "multipath_scale":    4.0,  # scale factor for multipath error magnitude (m)    
+                    # Outages (disabled by default)
+                    "outage_prob_per_s":  0.05, #  chance per second of outage starting
+                    "outage_duration_s":  3.00, #  average outage duration (exponential distribution)
+                    # RNG seed (-1 = random)
+                    "seed":              -1,
+                }
+            ],
+        )] if use_gps_bool else []),
         # Debug Logger
         Node(
             package="vio_pipeline",
@@ -202,6 +239,16 @@ def generate_launch_description():
                 "use_sim_time",
                 default_value="true",
                 description="Use simulation time from bag",
+            ),
+            DeclareLaunchArgument(
+                "use_tf_publisher",
+                default_value="false",
+                description="Launch tf_publisher_node (map→base_link + sensor static TFs)",
+            ),
+            DeclareLaunchArgument(
+                "use_gps_simulator",
+                default_value="true",
+                description="Launch gps_simulator_node (samples /gt_pub/pose, publishes /gps/fix)",
             ),
             OpaqueFunction(function=_make_nodes),
         ]
