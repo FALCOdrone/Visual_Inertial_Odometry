@@ -148,6 +148,19 @@ def _make_nodes(context, *args, **kwargs):
                 }
             ],
         ),
+        # TF Publisher
+        Node(
+            package="vio_pipeline",
+            executable="tf_publisher_node",
+            name="tf_publisher_node",
+            output="screen",
+            parameters=[
+                {
+                    "config_path": config_file,
+                    "use_sim_time": use_sim_time_bool,
+                }
+            ],
+        ),
         # Debug Logger
         Node(
             package="vio_pipeline",
