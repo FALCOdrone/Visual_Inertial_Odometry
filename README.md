@@ -1,6 +1,6 @@
 # Visual-Inertial Odometry Pipeline
 
-A ROS 2 stereo visual-inertial odometry system that fuses **Shi-Tomasi + KLT optical flow** feature tracking with an **Error-State Kalman Filter (ESKF)** for 6-DOF pose estimation. The pipeline processes synchronized stereo images and IMU data at 200 Hz, with optional simulated GPS fusion. It is evaluated on the [EuRoC MAV](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets) and [UZH FPV](https://fpv.ifi.uzh.ch/) indoor datasets using Absolute Trajectory Error (ATE) with Umeyama SE(3) alignment and Relative Pose Error (RPE) over multiple segment lengths.
+A ROS 2 stereo visual-inertial odometry system that fuses **Shi-Tomasi + KLT optical flow** feature tracking with an **Error-State Kalman Filter (ESKF)** for 6-DOF pose estimation. The pipeline processes synchronized stereo images and IMU data at 200 Hz, with optional simulated GPS fusion. It is evaluated on the [EuRoC MAV](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets)   dataset using Absolute Trajectory Error (ATE) with Umeyama SE(3) alignment and Relative Pose Error (RPE) over multiple segment lengths.
 
 ---
 
