@@ -1,6 +1,8 @@
+import struct
+
 import rclpy  # type: ignore
 from rclpy.node import Node  # type: ignore
-from sensor_msgs.msg import Image  # type: ignore
+from sensor_msgs.msg import Image, PointCloud2, PointField  # type: ignore
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy  # type: ignore
 from message_filters import Subscriber, ApproximateTimeSynchronizer  # type: ignore
 from geometry_msgs.msg import PoseStamped, Vector3Stamped  # type: ignore
@@ -105,6 +107,11 @@ class PoseEstimationNode(Node):
         self.path_msg = Path()
         self.path_msg.header.frame_id = "map"
 
+        # Accumulated world-frame landmark points for the map pointcloud.
+        # Capped at _MAP_MAX to bound memory usage.
+        self._map_points: np.ndarray = np.empty((0, 3), dtype=np.float32)
+        self._MAP_MAX: int = 200_000
+
         self._setup_ros_topics()
         self.get_logger().info("PoseEstimationNode initialized")
 
@@ -168,6 +175,7 @@ class PoseEstimationNode(Node):
         self.odom_pub = self.create_publisher(Odometry, "/vio/odometry", 10)
         self.rpy_pub = self.create_publisher(Vector3Stamped, "/vio/rpy", 10)
         self.temporal_viz_pub = self.create_publisher(Image, "/features/temporal_viz", 10)
+        self.map_pub = self.create_publisher(PointCloud2, "/vio/map", 10)
 
         self.get_logger().info("ROS topics initialized")
 
@@ -241,14 +249,28 @@ class PoseEstimationNode(Node):
         pts3d = self._triangulate(kpts_l_prev_u, kpts_r_prev_u)
 
         # --- PnP: find cam0_curr pose relative to cam0_prev ---
-        T_rel = self._solve_pnp(pts3d, kpts_l_curr_u, ts_ns)
+        # _solve_pnp also returns the PnP-inlier 3D points (in cam0_prev frame)
+        # so we can project them to the world frame for the map pointcloud.
+        T_rel, pts3d_inliers_cam = self._solve_pnp(pts3d, kpts_l_curr_u, ts_ns)
         if T_rel is None:
             return
+
+        # Transform inlier points to world frame BEFORE updating the pose
+        # (T_world_cam0 currently describes cam0_prev → world).
+        R_wc = self.T_world_cam0[:3, :3]
+        t_wc = self.T_world_cam0[:3, 3]
+        pts3d_world = (pts3d_inliers_cam @ R_wc.T + t_wc).astype(np.float32)
+
+        # Accumulate map points, drop oldest if over cap
+        self._map_points = np.concatenate([self._map_points, pts3d_world], axis=0)
+        if len(self._map_points) > self._MAP_MAX:
+            self._map_points = self._map_points[-self._MAP_MAX:]
 
         # T_rel: p_curr = T_rel @ p_prev  →  cam0_curr in world frame:
         self.T_world_cam0 = self.T_world_cam0 @ np.linalg.inv(T_rel)
 
         self._publish_pose(stamp, ts_ns)
+        self._publish_map(stamp)
 
     def _undistort_points(self, pts, K, dist):
         """Undistort 2D keypoints back into ideal pixel coordinates."""
@@ -276,7 +298,9 @@ class PoseEstimationNode(Node):
         pts3d:  (N, 3) landmarks in cam0_prev frame
         kpts2d: (N, 2) observations in cam0_curr image (undistorted)
 
-        Returns 4×4 T such that p_curr = T @ p_prev, or None on failure.
+        Returns (T, pts3d_inliers) where T is a 4×4 matrix such that
+        p_curr = T @ p_prev, and pts3d_inliers are the PnP-inlier 3D points
+        in cam0_prev frame.  Returns (None, None) on failure.
         """
         # Depth filter: keep only points in a plausible stereo range
         valid = (pts3d[:, 2] > 0.1) & (pts3d[:, 2] < self.max_depth)
@@ -287,7 +311,7 @@ class PoseEstimationNode(Node):
             self.get_logger().warn(
                 f"ts={ts_ns} | too few depth-valid points ({len(pts3d_v)})"
             )
-            return None
+            return None, None
 
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(
             pts3d_v,
@@ -303,7 +327,7 @@ class PoseEstimationNode(Node):
         n_in = len(inliers) if inliers is not None else 0
         if not ok or inliers is None or n_in < 6:
             self.get_logger().warn(f"ts={ts_ns} | PnP RANSAC failed (inliers={n_in})")
-            return None
+            return None, None
 
         # Inlier ratio guard: low ratio → RANSAC found a small bad consensus
         inlier_ratio = n_in / len(pts3d_v)
@@ -311,10 +335,11 @@ class PoseEstimationNode(Node):
             self.get_logger().warn(
                 f"ts={ts_ns} | inlier ratio too low ({inlier_ratio:.2f} < {self.min_inlier_ratio})"
             )
-            return None
+            return None, None
+
+        inlier_idx = inliers.ravel()
 
         # Refine on inliers with iterative non-linear optimisation
-        inlier_idx = inliers.ravel()
         _, rvec, tvec = cv2.solvePnP(
             pts3d_v[inlier_idx],
             pts2d_v[inlier_idx],
@@ -337,12 +362,12 @@ class PoseEstimationNode(Node):
             self.get_logger().warn(
                 f"ts={ts_ns} | translation too large ({translation:.3f}m > {self.max_translation}m), skipping"
             )
-            return None
+            return None, None
         if angle_deg > self.max_rotation_deg:
             self.get_logger().warn(
                 f"ts={ts_ns} | rotation too large ({angle_deg:.1f}° > {self.max_rotation_deg}°), skipping"
             )
-            return None
+            return None, None
 
         self.get_logger().info(
             f"ts={ts_ns} | PnP inliers={n_in}/{len(pts3d_v)} ({inlier_ratio:.0%}) "
@@ -352,7 +377,7 @@ class PoseEstimationNode(Node):
         T = np.eye(4)
         T[:3, :3] = R
         T[:3, 3] = t
-        return T
+        return T, pts3d_v[inlier_idx]
 
     def _publish_pose(self, stamp, ts_ns):
         """Publish current pose as PoseStamped, Path, and Odometry.
@@ -400,6 +425,30 @@ class PoseEstimationNode(Node):
         self.rpy_pub.publish(rpy_msg)
 
         self.get_logger().info(f"ts={ts_ns} | pos=({t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f})")
+
+    def _publish_map(self, stamp) -> None:
+        """Publish accumulated world-frame landmarks as sensor_msgs/PointCloud2."""
+        pts = self._map_points  # (N, 3) float32
+        n = len(pts)
+        if n == 0:
+            return
+
+        msg = PointCloud2()
+        msg.header.stamp = stamp
+        msg.header.frame_id = "map"
+        msg.height = 1
+        msg.width = n
+        msg.is_dense = False
+        msg.is_bigendian = False
+        msg.point_step = 12  # 3 × float32
+        msg.row_step = msg.point_step * n
+        msg.fields = [
+            PointField(name="x", offset=0,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4,  datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8,  datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.data = pts.tobytes()
+        self.map_pub.publish(msg)
 
 
 def main(args=None):
