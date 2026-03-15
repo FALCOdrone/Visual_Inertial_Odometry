@@ -142,11 +142,19 @@ class PoseEstimationNode(Node):
         # Transform that maps cam0 points → cam1 frame
         self.T_c1_c0 = np.linalg.inv(self.T_b_c1) @ self.T_b_c0
 
-        # Stereo projection matrices (cam0 as reference frame)
-        R = self.T_c1_c0[:3, :3]
-        t = self.T_c1_c0[:3, 3:]
-        self.P0 = self.cam0_K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-        self.P1 = self.cam1_K @ np.hstack([R, t])
+        # Rectified stereo projection matrices and rectified intrinsics.
+        # After rectification distortion is zero and epipolar lines are horizontal.
+        R_rel = self.T_c1_c0[:3, :3]
+        t_rel = self.T_c1_c0[:3, 3]
+        w, h = cam0["resolution"]
+        _, _, P0_rect, P1_rect, _, _, _ = cv2.stereoRectify(
+            self.cam0_K, self.cam0_dist,
+            self.cam1_K, self.cam1_dist,
+            (w, h), R_rel, t_rel, alpha=0,
+        )
+        self.K_rect = P0_rect[:3, :3].copy()
+        self.P0 = P0_rect
+        self.P1 = P1_rect
 
     def _setup_ros_topics(self):
         qos = QoSProfile(
@@ -155,8 +163,8 @@ class PoseEstimationNode(Node):
             depth=10,
         )
 
-        self.cam0_sub = Subscriber(self, Image, "/cam0/image_raw", qos_profile=qos)
-        self.cam1_sub = Subscriber(self, Image, "/cam1/image_raw", qos_profile=qos)
+        self.cam0_sub = Subscriber(self, Image, "/cam0/image_rect", qos_profile=qos)
+        self.cam1_sub = Subscriber(self, Image, "/cam1/image_rect", qos_profile=qos)
 
         self.time_sync = ApproximateTimeSynchronizer(
             [self.cam0_sub, self.cam1_sub], queue_size=10, slop=0.1
@@ -232,16 +240,12 @@ class PoseEstimationNode(Node):
             )
             return
 
-        # Undistort all keypoints once so triangulation and PnP use a consistent model
-        kpts_l_prev_u = self._undistort_points(tracks["kpts_l_prev"], self.cam0_K, self.cam0_dist)
-        kpts_r_prev_u = self._undistort_points(tracks["kpts_r_prev"], self.cam1_K, self.cam1_dist)
-        kpts_l_curr_u = self._undistort_points(tracks["kpts_l_curr"], self.cam0_K, self.cam0_dist)
-
+        # Images are rectified — keypoints are already in undistorted coordinates
         # --- Triangulate 3D landmarks from the previous stereo pair ---
-        pts3d = self._triangulate(kpts_l_prev_u, kpts_r_prev_u)
+        pts3d = self._triangulate(tracks["kpts_l_prev"], tracks["kpts_r_prev"])
 
         # --- PnP: find cam0_curr pose relative to cam0_prev ---
-        T_rel = self._solve_pnp(pts3d, kpts_l_curr_u, ts_ns)
+        T_rel = self._solve_pnp(pts3d, tracks["kpts_l_curr"], ts_ns)
         if T_rel is None:
             return
 
@@ -292,8 +296,8 @@ class PoseEstimationNode(Node):
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(
             pts3d_v,
             pts2d_v,
-            self.cam0_K,
-            None,  # keypoints already undistorted
+            self.K_rect,
+            None,  # images are rectified — distortion is zero
             iterationsCount=200,
             reprojectionError=2.0,
             confidence=0.999,
@@ -318,7 +322,7 @@ class PoseEstimationNode(Node):
         _, rvec, tvec = cv2.solvePnP(
             pts3d_v[inlier_idx],
             pts2d_v[inlier_idx],
-            self.cam0_K,
+            self.K_rect,
             None,
             rvec, tvec,
             useExtrinsicGuess=True,

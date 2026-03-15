@@ -54,8 +54,8 @@ class FeatureTrackingNode(Node):
             depth=10,
         )
 
-        self.cam0_sub = Subscriber(self, Image, "/cam0/image_raw", qos_profile=qos)
-        self.cam1_sub = Subscriber(self, Image, "/cam1/image_raw", qos_profile=qos)
+        self.cam0_sub = Subscriber(self, Image, "/cam0/image_rect", qos_profile=qos)
+        self.cam1_sub = Subscriber(self, Image, "/cam1/image_rect", qos_profile=qos)
 
         self.time_sync = ApproximateTimeSynchronizer(
             [self.cam0_sub, self.cam1_sub], queue_size=10, slop=0.1

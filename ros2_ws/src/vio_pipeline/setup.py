@@ -31,6 +31,7 @@ setup(
             "debug_logger_node = vio_pipeline.debug_logger_node:main",
             "tf_publisher_node = vio_pipeline.tf_publisher_node:main",
             "gps_simulator_node = vio_pipeline.gps_simulator_node:main",
+            "stereo_rectifier_node = vio_pipeline.stereo_rectifier_node:main",
         ],
     },
 )

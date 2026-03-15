@@ -36,9 +36,12 @@ class FeatureExtractor:
         max_level: int = 3,           # pyramid depth for KLT; higher levels let the tracker (prev 3)
                                       #   handle larger motions (each level halves the image),
                                       #   0 disables the pyramid (only works for tiny motions)
+        max_epipolar_err: float = 2.0,  # max allowed y-pixel offset between stereo matches;
+                                        #   valid only when rectified images are used
     ):
         self.max_corners = max_corners
         self.min_distance = min_distance
+        self.max_epipolar_err = max_epipolar_err
         self._shi_params = dict(
             maxCorners=max_corners,
             qualityLevel=quality_level,
@@ -257,6 +260,11 @@ class FeatureExtractor:
             pts_r_curr, mask_stereo, _ = self._circular_track(
                 left_image, right_image, pts_l_curr, pixel_threshold
             )
+            # Epipolar constraint (valid for rectified images): matches must lie
+            # on the same scanline and have positive disparity.
+            y_off = np.abs(pts_r_curr[:, 1] - pts_l_curr[:, 1])
+            disp  = pts_l_curr[:, 0] - pts_r_curr[:, 0]
+            mask_stereo = mask_stereo & (y_off < self.max_epipolar_err) & (disp > 0)
         else:
             pts_r_curr = np.empty((0, 2), np.float32)
             mask_stereo = np.zeros(0, dtype=bool)

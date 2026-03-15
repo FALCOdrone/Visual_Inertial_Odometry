@@ -33,9 +33,11 @@ def _make_nodes(context, *args, **kwargs):
     use_tf       = LaunchConfiguration("use_tf_publisher").perform(context)
     use_gps      = LaunchConfiguration("use_gps").perform(context)
     gps_mode     = LaunchConfiguration("gps_mode").perform(context).lower()
-    use_sim_time_bool = use_sim_time.lower() in ("true", "1", "yes")
-    use_tf_bool       = use_tf.lower()  in ("true", "1", "yes")
-    use_gps_bool      = use_gps.lower() in ("true", "1", "yes")
+    use_rectifier = LaunchConfiguration("use_rectifier").perform(context)
+    use_sim_time_bool  = use_sim_time.lower()  in ("true", "1", "yes")
+    use_tf_bool        = use_tf.lower()        in ("true", "1", "yes")
+    use_gps_bool       = use_gps.lower()       in ("true", "1", "yes")
+    use_rectifier_bool = use_rectifier.lower() in ("true", "1", "yes")
 
     # Load GPS profiles from YAML
     pkg_share = get_package_share_directory("vio_pipeline")
@@ -195,6 +197,19 @@ def _make_nodes(context, *args, **kwargs):
                 }
             ],
         )] if use_tf_bool else []),
+        # Stereo Rectifier (use_rectifier:=true to enable)
+        *([Node(
+            package="vio_pipeline",
+            executable="stereo_rectifier_node",
+            name="stereo_rectifier_node",
+            output="screen",
+            parameters=[
+                {
+                    "config_path": config_file,
+                    "use_sim_time": use_sim_time_bool,
+                }
+            ],
+        )] if use_rectifier_bool else []),
         # GPS Simulator (use_gps:=true to enable)
         *([Node(
             package="vio_pipeline",
@@ -269,6 +284,11 @@ def generate_launch_description():
                 "use_tf_publisher",
                 default_value="false",
                 description="Launch tf_publisher_node (map→base_link + sensor static TFs)",
+            ),
+            DeclareLaunchArgument(
+                "use_rectifier",
+                default_value="true",
+                description="Launch stereo_rectifier_node (publishes /cam0/image_rect, /cam1/image_rect)",
             ),
             DeclareLaunchArgument(
                 "use_gps",
