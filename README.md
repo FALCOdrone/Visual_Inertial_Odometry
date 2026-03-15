@@ -1,6 +1,6 @@
 # Visual-Inertial Odometry Pipeline
 
-A ROS 2 stereo visual-inertial odometry system that fuses **Shi-Tomasi + KLT optical flow** feature tracking with an **Error-State Kalman Filter (ESKF)** for 6-DOF pose estimation. The pipeline processes synchronized stereo images and IMU data at 200 Hz, with optional simulated GPS fusion. It is evaluated on the [EuRoC MAV](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets)   dataset using Absolute Trajectory Error (ATE) with Umeyama SE(3) alignment and Relative Pose Error (RPE) over multiple segment lengths.
+A ROS 2 stereo visual-inertial odometry system that fuses **Shi-Tomasi + KLT optical flow** feature tracking with either an **Error-State Kalman Filter (ESKF)** or a **sliding-window Factor Graph Optimization (FGO) backend** for 6-DOF pose estimation. The pipeline processes synchronized stereo images and IMU data at 200 Hz, with optional simulated GPS streams (`/gps/fix`, `/gps/enu`). It is evaluated on the [EuRoC MAV](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets) dataset using Absolute Trajectory Error (ATE) with Umeyama SE(3) alignment and Relative Pose Error (RPE) over multiple segment lengths.
 
 ---
 
@@ -11,22 +11,36 @@ A ROS 2 stereo visual-inertial odometry system that fuses **Shi-Tomasi + KLT opt
 3. [Stereo Triangulation and PnP-RANSAC](#3-stereo-triangulation-and-pnp-ransac)
 4. [IMU Processing](#4-imu-processing)
 5. [Error-State Kalman Filter (ESKF)](#5-error-state-kalman-filter-eskf)
-6. [GPS Fusion](#6-gps-fusion)
-7. [Coordinate Frames](#7-coordinate-frames)
-8. [Trajectory Evaluation](#8-trajectory-evaluation)
-9. [Project Structure](#9-project-structure)
-10. [Installation](#10-installation)
-11. [Running the Pipeline](#11-running-the-pipeline)
-12. [ROS 2 Topics and Parameters](#12-ros-2-topics-and-parameters)
-13. [Configuration Files](#13-configuration-files)
+6. [Factor Graph Optimization (FGO) Backend](#6-factor-graph-optimization-fgo-backend)
+7. [GPS Fusion](#7-gps-fusion)
+8. [Coordinate Frames](#8-coordinate-frames)
+9. [Trajectory Evaluation](#9-trajectory-evaluation)
+10. [Project Structure](#10-project-structure)
+11. [Installation](#11-installation)
+12. [Running the Pipeline](#12-running-the-pipeline)
+13. [ROS 2 Topics and Parameters](#13-ros-2-topics-and-parameters)
+14. [Configuration Files](#14-configuration-files)
 
 ---
 
 ## 1. Architecture Overview
 
+The pipeline supports two fusion backends, selected at launch time with `use_fgo:=true|false`:
+
+- **ESKF (default):** Extended Kalman Filter operating at IMU rate (200 Hz) with VIO corrections at ~20 Hz.
+- **FGO (WIP):** Sliding-window factor graph with IMU preintegration and VO relative-pose factors, optimized via Levenberg-Marquardt at keyframe rate (~20 Hz).
+
+When `use_fgo:=true`, the ESKF node is not launched; the FGO backend replaces it.
+
 ```
                           EuRoC / UZH Bag
   /cam0/image_raw (20 Hz)   /cam1/image_raw (20 Hz)   /imu0 (200 Hz)   /gt/pose
+         |                          |                       |               |
+         v                          v                       |               |
+  +----------------------------------+                      |               |
+  | StereoRectifierNode (optional)   |                      |               |
+  | undistort + rectify stereo pair  |                      |               |
+  +------+---------------------------+                      |               |
          |                          |                       |               |
          |   ApproximateTimeSynchronizer                     |               |
          v                          v                       v               v
@@ -41,21 +55,27 @@ A ROS 2 stereo visual-inertial odometry system that fuses **Shi-Tomasi + KLT opt
   |  undistort keypoints              |    /imu/processed (200 Hz)     /gt_pub/odometry
   |  stereo triangulation             |           |                         |
   |  PnP-RANSAC + LM refinement       |           v                         v
-  |  layered outlier rejection        |    +------------------------+  +---------------------------+
-  |  pose accumulation                |    |      EskfNode          |  | GpsSimulatorNode          |
-  +------+-----------------------------+    |        (200 Hz)        |  |  (optional, ~5-20 Hz)     |
-         |                                 |                        |  |                           |
-  /vio/pose                                | IMU prediction 200 Hz  |<-| /gt_pub/pose -> corrupt   |
-  /vio/path                                | VIO update     20 Hz   |  | -> /gps/fix, /gps/enu    |
-  /vio/odometry  -------->                 | GPS update     ~5 Hz   |  +---------------------------+
-  /vio/rpy                                 | Joseph-form cov update |
-                                           | gravity estimation     |
+  |  keyframe selection               |                                +---------------------------+
+  |  dynamic pose covariance          |    +========================+  | GpsSimulatorNode          |
+  |  pose accumulation                |    ||  ESKF  OR  FGO       ||  |  (optional, ~5-20 Hz)     |
+  +------+-----------------------------+    ||  (select at launch)  ||  |                           |
+         |                                 |========================|  | /gt_pub/pose -> corrupt   |
+  /vio/pose                                |                        |  | -> /gps/fix, /gps/enu    |
+  /vio/path                                | ESKF: IMU pred 200 Hz  |  +---------------------------+
+  /vio/odometry  -------->                 |   VIO update    20 Hz  |
+  /vio/rpy                                 |   GPS update    ~5 Hz  |<-- /gps/enu (ESKF only)
+                                           |   Joseph-form cov      |
+                                           | -or-                   |
+                                           | FGO: IMU preintegration|
+                                           |   VO relative factors  |
+                                           |   LM optimization      |
+                                           |   Schur marginalization|
                                            +------+-----------------+
                                                   |
-                                           /eskf/odometry (200 Hz)
-                                           /eskf/pose
-                                           /eskf/path
-                                           /eskf/rpy
+                                           /eskf/odometry (200 Hz)    -- ESKF mode
+                                           /fgo/odometry  (~20 Hz)    -- FGO mode
+                                           /{eskf,fgo}/pose
+                                           /{eskf,fgo}/path
                                                   |
                                                   v
                               +-------------------------------+     +-------------------------+
@@ -148,7 +168,7 @@ where `dI = I_prev(x,y) - I_curr(x,y)`. This is identical to the structure tenso
 
 | Parameter | Code name | Default | Description |
 |---|---|---|---|
-| Window size | `winSize` | (14, 14) | Patch size for photometric matching |
+| Window size | `winSize` | (21, 21) | Patch size for photometric matching |
 | Pyramid depth | `maxLevel` | 3 | Number of pyramid levels (0 = no pyramid) |
 | Max iterations | `criteria.maxCount` | 30 | Iteration limit per pyramid level |
 | Epsilon | `criteria.epsilon` | 0.01 | Convergence threshold (pixels) |
@@ -184,7 +204,13 @@ kpts_r_prev (N, 2)    [for triangulation in the previous stereo pair]
 
 Implemented in `vio_node.py` as `PoseEstimationNode`. This node subscribes to synchronized stereo images, runs the feature tracker, and estimates frame-to-frame pose via a triangulation-then-PnP pipeline.
 
-### 3.1 Undistortion
+### 3.1 Stereo Rectification
+
+The `StereoRectifierNode` (enabled by default with `use_rectifier:=true`) applies `cv2.stereoRectify` and `cv2.initUndistortRectifyMap` to produce row-aligned, undistorted stereo images published on `/cam0/image_rect` and `/cam1/image_rect`. The rectification maps are computed once at startup from the cam0/cam1 intrinsics, distortion coefficients, and the extrinsic transform `T_c1_c0`.
+
+When rectification is active, the downstream `PoseEstimationNode` subscribes to the rectified topics and can enforce an **epipolar constraint** on stereo matches: matched keypoints with vertical disparity exceeding `max_epipolar_err` (default: 2.0 px) are rejected.
+
+### 3.2 Undistortion
 
 Keypoints are detected on the original (distorted) images for tracking robustness. Before any geometric computation, all keypoints are mapped to ideal (undistorted) pixel coordinates using the **radial-tangential distortion model**:
 
@@ -199,7 +225,7 @@ The undistortion is computed via `cv2.undistortPoints(pts, K, dist, P=K)`, which
 
 Separate intrinsics and distortion coefficients are used for cam0 and cam1 as specified in the config YAML.
 
-### 3.2 Projection Matrices
+### 3.3 Projection Matrices
 
 The stereo geometry is defined by the relative transform `T_c1_c0` from cam0 to cam1, derived from the Kalibr extrinsics:
 
@@ -214,7 +240,7 @@ P0 = K0 @ [I_3 | 0]              (cam0 is the reference frame)
 P1 = K1 @ [R_c1_c0 | t_c1_c0]    (cam1 relative to cam0)
 ```
 
-### 3.3 DLT Triangulation
+### 3.4 DLT Triangulation
 
 For each stereo-matched pair `(p_L, p_R)` of undistorted 2D keypoints, the 3D point `X` in the cam0 frame is computed using `cv2.triangulatePoints`:
 
@@ -232,7 +258,7 @@ The solution is the right singular vector of A corresponding to the smallest sin
 
 **Depth filtering:** Points with `Z < 0.1 m` (behind camera or degenerate) or `Z > max_depth` (default 30 m, noisy at large baselines) are rejected before PnP.
 
-### 3.4 PnP-RANSAC with Layered Outlier Rejection
+### 3.5 PnP-RANSAC with Layered Outlier Rejection
 
 Given N 3D landmarks `{X_i}` triangulated from the **previous** stereo pair and their 2D observations `{p_i}` in the **current** left image, the perspective-n-point problem solves for the relative camera pose:
 
@@ -279,7 +305,30 @@ Using the RANSAC solution as initial guess, the iterative solver minimises repro
 | Max translation | `||t|| <= max_translation` | 0.5 m/frame | Reject pose jumps |
 | Max rotation | `angle <= max_rotation_deg` | 30.0 deg/frame | Reject orientation flips |
 
-### 3.5 Pose Accumulation
+### 3.6 Keyframe Selection
+
+Not every VIO frame triggers a backend update. The `PoseEstimationNode` publishes a pose only when at least one of these conditions is met since the last keyframe:
+
+| Gate | Threshold | Default |
+|---|---|---|
+| Translation | accumulated Euclidean distance >= threshold | `kf_min_translation = 0.03` m |
+| Rotation | accumulated angular change >= threshold | `kf_min_rotation_deg = 2.0` deg |
+| Frame count | frames since last keyframe >= max | `kf_max_frames = 5` (0.25 s at 20 Hz) |
+
+This reduces redundant updates during stationary periods while ensuring the filter does not starve during slow motion.
+
+### 3.7 Dynamic Pose Covariance
+
+The `PoseEstimationNode` fills the `pose.covariance` field of its `Odometry` message based on the RANSAC inlier ratio:
+
+```
+sigma = base_std / inlier_ratio
+covariance_diag = sigma^2
+```
+
+At a typical inlier ratio of ~0.6, this yields per-axis position uncertainty of ~0.05 m (matching `meas_pos_std`). Both the ESKF and FGO backends extract this covariance from the incoming VIO message to weight updates appropriately.
+
+### 3.8 Pose Accumulation
 
 `solvePnPRansac` returns `T_curr_prev` (the current camera pose relative to the previous camera frame). The world-frame poses are accumulated as:
 
@@ -295,7 +344,7 @@ The initial `T_world_cam0` is set to `T_body_to_ros @ T_b_c0`, where `T_body_to_
 
 ## 4. IMU Processing
 
-Implemented in `imu_processing_node.py` as `ImuProcessingNode`. This node preprocesses raw IMU data before ESKF fusion.
+Implemented in `imu_processing_node.py` as `ImuProcessingNode`. This node preprocesses raw IMU data before ESKF/FGO fusion.
 
 ### 4.1 Static Bias Initialisation
 
@@ -340,7 +389,7 @@ y[n] = b0*w[n] + b1*w[n-1] + b2*w[n-2]
 
 Delay states are seeded from the mean of the static init window to avoid startup transient.
 
-**Cutoff frequencies** (as set in the launch file):
+**Cutoff frequencies** (as set in `pipeline_params.yaml`):
 
 | Signal | Cutoff | IMU rate | Purpose |
 |---|---|---|---|
@@ -364,7 +413,7 @@ This dead-reckoning output drifts without fusion. It is published on `/imu/odome
 
 ## 5. Error-State Kalman Filter (ESKF)
 
-Implemented in `eskf_node.py` as `EskfNode`. Fuses bias-corrected IMU measurements (200 Hz) with visual odometry pose updates (~20 Hz) and optional GPS position updates (~5-20 Hz).
+Implemented in `eskf_node.py` as `EskfNode`. Fuses bias-corrected IMU measurements (200 Hz) with visual odometry pose updates (~20 Hz) and optional GPS position updates (~5-20 Hz). This is the **default** fusion backend; use `use_fgo:=true` to switch to the FGO backend instead.
 
 ### 5.1 State Vector
 
@@ -467,6 +516,8 @@ This structure means position observations affect `dp` (columns 0-2) and orienta
 
 **Measurement noise R (6x6):**
 
+When the incoming VIO message carries nonzero covariance (dynamic pose covariance from section 3.7), that covariance is used directly. Otherwise:
+
 ```
 R = diag([ meas_pos_std^2,  meas_pos_std^2,  meas_pos_std^2,
            meas_ang_std^2,  meas_ang_std^2,  meas_ang_std^2 ])
@@ -529,7 +580,7 @@ If `NIS > gps_gate_chi2`, the GPS sample is rejected. This suppresses multipath 
 | 95% | 7.815 |
 | 99% | 11.345 |
 
-The default gate is `7.815` (standalone mode) or `0.0` (disabled, RTK mode -- see section 6).
+The default gate is `7.815` (standalone mode) or `0.0` (disabled, RTK mode -- see section 7).
 
 If the gate passes, the standard Joseph-form update is applied with all 15 error states injected (position, velocity, attitude, and biases).
 
@@ -546,9 +597,139 @@ where `R_init` is the rotation matrix from the first VIO quaternion. This avoids
 
 ---
 
-## 6. GPS Fusion
+## 6. Factor Graph Optimization (FGO) Backend
 
-### 6.1 GPS Simulator (`gps_simulator_node.py`)
+Status: **Work in progress (WIP)**.
+
+Implemented across three modules:
+
+- `fgo_backend_node.py` -- ROS 2 node that orchestrates keyframe management and publishes optimized poses
+- `imu_preintegrator.py` -- on-manifold IMU preintegration (Forster et al., TRO 2017)
+- `factor_graph.py` -- sliding-window factor graph with LM optimization and Schur-complement marginalization
+- `so3_utils.py` -- shared SO(3) rotation utilities (exponential/logarithmic maps, Jacobians, quaternion conversions)
+
+The FGO backend replaces the ESKF when launched with `use_fgo:=true`. It subscribes to the same topics (`/imu/processed`, `/vio/odometry`, `/imu0` for gravity estimation) and publishes on `/fgo/odometry`, `/fgo/pose`, `/fgo/path`. Because this backend is still WIP, expect interface/behavior changes.
+
+### 6.1 Keyframe State
+
+Each keyframe node in the factor graph carries a 15-DOF state on the SO(3) x R^12 manifold:
+
+```
+x_k = [ R(3x3)   p(3)   v(3)   b_a(3)   b_g(3) ]
+       rotation  position velocity accel-bias gyro-bias
+```
+
+Updates are applied via the **retract** operation (manifold oplus):
+
+```
+R_new   = R @ Exp(delta_theta)
+p_new   = p + delta_p
+v_new   = v + delta_v
+b_a_new = b_a + delta_ba
+b_g_new = b_g + delta_bg
+```
+
+### 6.2 IMU Preintegration
+
+Between consecutive keyframes, all IMU measurements are preintegrated into compact rotation, velocity, and position deltas. This avoids re-integrating the full IMU stream during optimization.
+
+**Preintegrated measurements** (accumulated in the body frame of keyframe `i`):
+
+```
+delta_R_ij = prod_k Exp((omega_k - b_g) * dt_k)
+delta_v_ij = sum_k delta_R_ik @ (a_k - b_a) * dt_k
+delta_p_ij = sum_k delta_v_ik * dt_k + 0.5 * delta_R_ik @ (a_k - b_a) * dt_k^2
+```
+
+**Covariance propagation (9x9):** The preintegrator tracks the uncertainty of `[delta_theta, delta_v, delta_p]` using a first-order discrete propagation:
+
+```
+F_d = I_9 + A * dt       (discrete transition matrix)
+Sigma <- F_d @ Sigma @ F_d^T + B @ Q_d @ B^T
+```
+
+where `A` contains the continuous-time Jacobians (rotation-velocity coupling via `skew(f_corr)`) and `Q_d = diag(sigma_g^2, sigma_a^2) * dt`.
+
+**First-order bias correction:** Rather than re-preintegrating when biases change during optimization, the bias Jacobians `d_R/d_bg`, `d_v/d_ba`, `d_v/d_bg`, `d_p/d_ba`, `d_p/d_bg` are accumulated during integration and used for a linear correction:
+
+```
+delta_R_corr = delta_R @ Exp(d_R_d_bg @ db_g)
+delta_v_corr = delta_v + d_v_d_ba @ db_a + d_v_d_bg @ db_g
+delta_p_corr = delta_p + d_p_d_ba @ db_a + d_p_d_bg @ db_g
+```
+
+**IMU noise scaling:** Following the practice of VINS-Mono and other optimization-based VIO systems, the IMU white noise is scaled by `imu_noise_scale` (default: 20x) before preintegration. Datasheet noise densities are too tight for the discrete-time integration approximation, causing IMU factors to dominate over VO factors in the optimization.
+
+### 6.3 Factor Types
+
+**IMU preintegration factor** (15-dimensional residual connecting keyframes `i` and `j`):
+
+```
+r_R   = Log(delta_R_corr^T @ R_i^T @ R_j)
+r_v   = R_i^T @ (v_j - v_i - g*dt) - delta_v_corr
+r_p   = R_i^T @ (p_j - p_i - v_i*dt - 0.5*g*dt^2) - delta_p_corr
+r_ba  = b_a_j - b_a_i
+r_bg  = b_g_j - b_g_i
+```
+
+The information matrix is block-diagonal: `[inv(Sigma_preint)(9x9), info_ba(3x3), info_bg(3x3)]`, where the bias blocks encode random-walk uncertainty `1/(sigma_b^2 * dt)`.
+
+**VO relative-pose factor** (6-dimensional residual):
+
+```
+r_R = Log(dR_meas^T @ R_i^T @ R_j)
+r_p = dR_meas^T @ (R_i^T @ (p_j - p_i) - dp_meas)
+```
+
+The information matrix is extracted from the VIO message covariance (dynamic, based on inlier ratio) or falls back to `diag(vo_pos_std^2, vo_ang_std^2)`.
+
+**Prior factor:** On the first keyframe, a diagonal prior constrains all 15 state dimensions. After marginalization, the prior becomes a dense linearized factor from the Schur complement (see section 6.5).
+
+### 6.4 Levenberg-Marquardt Optimization
+
+The graph is optimized by solving the normal equations at each iteration:
+
+```
+(H + lambda * diag(H)) @ delta = -b
+
+where H = sum_factors J^T @ Omega @ J     (Hessian approximation)
+      b = sum_factors J^T @ Omega @ r     (gradient)
+```
+
+The solver features:
+- **Adaptive damping:** `lambda` is halved on cost decrease, quintupled on increase, clamped to `[1e-8, 1e6]`.
+- **Per-component step clamping:** rotation limited to 0.1 rad, position to 1.0 m, velocity to 2.0 m/s, biases to 0.01/0.001 per iteration. This prevents divergence from large initial guess errors.
+- **Convergence criterion:** `||delta|| < 1e-6` or `lm_max_iter` iterations reached (default: 8).
+
+For a window of W=10 keyframes, the system is 150x150 and solved via dense `numpy.linalg.solve`.
+
+### 6.5 Schur-Complement Marginalization
+
+When the window exceeds `window_size` keyframes, the oldest keyframe is marginalized:
+
+```
+| H_mm  H_mr | | dx_m |   | b_m |
+| H_rm  H_rr | | dx_r | = | b_r |
+
+H_prior = H_rr - H_rm @ inv(H_mm) @ H_mr
+b_prior = b_r  - H_rm @ inv(H_mm) @ b_m
+```
+
+The prior Hessian is factored via eigendecomposition `H_prior = V @ diag(lambda) @ V^T` into a square-root form `J_prior = diag(sqrt(lambda)) @ V^T`, with a corresponding residual `r0 = J_prior^{-T} @ b_prior`. This linearized prior is re-evaluated at each optimization step relative to its linearization point using the manifold `local()` operator.
+
+### 6.6 Gravity Estimation
+
+Like the ESKF, the FGO backend estimates gravity from raw `/imu0` accelerometer data collected before the first VIO keyframe. It waits for `min_gravity_samples` (default: 100) raw IMU samples, then computes:
+
+```
+g_world = R_first_vio @ (-mean(raw_accel))
+```
+
+---
+
+## 7. GPS Fusion
+
+### 7.1 GPS Simulator (`gps_simulator_node.py`)
 
 The `GpsSimulatorNode` creates realistic GPS measurements by corrupting the ground-truth position with a multi-component error model:
 
@@ -575,7 +756,7 @@ The corrupted ENU position is converted to WGS-84 latitude/longitude/altitude us
 
 During outages, a `NavSatFix` with `STATUS_NO_FIX` and NaN coordinates is published.
 
-### 6.2 GPS Profiles (`gps_profiles.yaml`)
+### 7.2 GPS Profiles (`gps_profiles.yaml`)
 
 Two pre-configured profiles model different receiver grades (based on Septentrio mosaic-G5 datasheet):
 
@@ -590,11 +771,15 @@ Each profile has two sections:
 
 The RTK profile disables the innovation gate because the EKF covariance converges to ~0.0025 m^2 after VIO updates, making the gate overly restrictive for valid cm-level corrections.
 
+GPS fusion is implemented only in ESKF mode (the FGO backend does not include GPS factors).
+
+Current launch behavior note: in `ros2_ws/src/vio_pipeline/launch/full_pipeline.launch.py`, the ESKF parameter `use_gps` is currently hardcoded to `False`. As a result, `use_gps:=true` launches `GpsSimulatorNode`, but ESKF GPS measurement updates are still disabled unless that launch file is adjusted.
+
 ---
 
-## 7. Coordinate Frames
+## 8. Coordinate Frames
 
-### 7.1 Kalibr T_BS Convention
+### 8.1 Kalibr T_BS Convention
 
 All extrinsic transforms follow the Kalibr convention:
 
@@ -604,7 +789,7 @@ p_body = T_BS @ p_sensor
 
 `T_BS` is the 4x4 homogeneous transform from the **sensor** frame (S) to the **body** frame (B). In TF2 terms, `T_BS` is published as `parent=base_link, child=sensor_frame`.
 
-### 7.2 World Frame
+### 8.2 World Frame
 
 The world frame is the **initial body frame** with a fixed rotation to the ROS FLU convention:
 
@@ -620,7 +805,7 @@ This ensures:
 - Gravity vector `g = [0, 0, -9.81]` points downward in the world frame
 - Both VIO and ground truth start at identity pose when properly aligned
 
-### 7.3 Ground Truth Alignment
+### 8.3 Ground Truth Alignment
 
 The `GroundTruthPublisherNode` aligns Vicon poses to the VIO world frame using the first ground-truth sample:
 
@@ -633,11 +818,11 @@ At `t=0` this yields identity, so both trajectories share the same starting pose
 
 ---
 
-## 8. Trajectory Evaluation
+## 9. Trajectory Evaluation
 
 The `evaluate_trajectory.py` script performs offline trajectory scoring using CSV logs written by `DebugLoggerNode`.
 
-### 8.1 Metrics
+### 9.1 Metrics
 
 **ATE (Absolute Trajectory Error) with Umeyama SE(3) alignment:**
 
@@ -670,7 +855,7 @@ rpe_i = || (p_est_j - p_est_i) - (p_gt_j - p_gt_i) ||
 
 Reported as percentage drift: `rpe / segment_length * 100%`.
 
-### 8.2 Output
+### 9.2 Output
 
 Results are saved to `logs/<YYYY-MM-DD_HH-MM-SS>/`:
 
@@ -681,7 +866,7 @@ Results are saved to `logs/<YYYY-MM-DD_HH-MM-SS>/`:
 | `ate_over_time.png` | Per-sample position and rotation ATE vs elapsed time |
 | `rpe_boxplot.png` | RPE distribution boxplots at each segment length |
 
-### 8.3 Usage
+### 9.3 Usage
 
 ```bash
 python evaluate_trajectory.py --input tmp/ --logs logs/
@@ -691,11 +876,13 @@ Requires `matplotlib` for plots (optional -- if missing, only `summary.txt` is g
 
 ---
 
-## 9. Project Structure
+## 10. Project Structure
 
 ```
 Visual_Inertial_Odometry/
 |-- README.md
+|-- requirements.txt
+|-- compare_logs.py                       # Compare/sort multiple logs/* runs
 |-- evaluate_trajectory.py                 # Offline ATE + RPE scoring
 |-- bag_utils/
 |   |-- euroc_to_bag.py                    # EuRoC MAV -> ROS 2 bag converter
@@ -711,16 +898,22 @@ Visual_Inertial_Odometry/
 |           |   |-- euroc_params.yaml      # EuRoC VI-Sensor calibration
 |           |   |-- uzh_indoor_params.yaml # UZH FPV camera + IMU calibration
 |           |   |-- gps_profiles.yaml      # GPS receiver simulation profiles
+|           |   |-- pipeline_params.yaml   # Centralized tunable parameters
 |           |-- launch/
-|           |   |-- full_pipeline.launch.py # Full VIO + ESKF + GT + optional GPS/TF
+|           |   |-- full_pipeline.launch.py # Full VIO + ESKF/FGO + GT + optional GPS/TF
 |           |   |-- features.launch.py      # Feature visualisation only
 |           |-- vio_pipeline/
 |               |-- __init__.py
 |               |-- feature_tracking_KLT.py    # Shi-Tomasi + KLT tracker
 |               |-- feature_tracking_node.py   # Standalone feature viz node
 |               |-- vio_node.py                # PoseEstimationNode
+|               |-- stereo_rectifier_node.py   # Stereo undistortion + rectification
 |               |-- imu_processing_node.py     # Bias removal, LPF, dead-reckoning
 |               |-- eskf_node.py               # Error-State Kalman Filter
+|               |-- fgo_backend_node.py        # Factor Graph Optimization backend
+|               |-- factor_graph.py            # Sliding-window graph + LM + Schur marginalisation
+|               |-- imu_preintegrator.py       # On-manifold IMU preintegration
+|               |-- so3_utils.py               # SO(3) exponential/log maps, Jacobians
 |               |-- ground_truth_publisher.py  # Aligned Vicon GT republisher
 |               |-- gps_simulator_node.py      # GPS error model simulator
 |               |-- tf_publisher_node.py       # TF2 static + dynamic broadcaster
@@ -734,17 +927,28 @@ Visual_Inertial_Odometry/
 | Node | Executable | Rate | Purpose |
 |---|---|---|---|
 | `PoseEstimationNode` | `pose_estimation_node` | 20 Hz | KLT tracking, triangulation, PnP pose |
+| `StereoRectifierNode` | `stereo_rectifier_node` | 20 Hz | Stereo undistortion and rectification |
 | `ImuProcessingNode` | `imu_processing_node` | 200 Hz | Bias removal, LPF, dead-reckoning |
-| `EskfNode` | `eskf_node` | 200 Hz | IMU + VIO + GPS fusion |
+| `EskfNode` | `eskf_node` | 200 Hz | IMU + VIO fusion backend (GPS-capable, see Section 7 note) |
+| `FgoBackendNode` | `fgo_backend_node` | ~20 Hz | IMU preintegration + VO factor graph (alternative backend) |
 | `GroundTruthPublisherNode` | `ground_truth_publisher` | variable | Aligned Vicon ground truth |
 | `GpsSimulatorNode` | `gps_simulator_node` | 5-20 Hz | Simulated GPS with realistic errors |
 | `TfPublisherNode` | `tf_publisher_node` | 200 Hz | TF2 tree (static extrinsics + dynamic map->base_link) |
 | `DebugLoggerNode` | `debug_logger_node` | passive | CSV logging of all pipeline topics |
 | `FeatureTrackingNode` | `feature_tracking_node` | 20 Hz | Feature visualisation (debug only) |
 
+### Library Modules (not ROS nodes)
+
+| Module | Purpose |
+|---|---|
+| `feature_tracking_KLT.py` | `FeatureExtractor` class -- Shi-Tomasi detection, KLT tracking, circular consistency |
+| `factor_graph.py` | `SlidingWindowGraph`, `KeyframeState`, factor dataclasses, LM optimizer, Schur marginalization |
+| `imu_preintegrator.py` | `ImuPreintegrator` -- on-manifold preintegration with covariance and bias Jacobians |
+| `so3_utils.py` | `exp_so3`, `log_so3`, `right_jacobian_so3`, `inv_right_jacobian_so3`, quaternion conversions |
+
 ---
 
-## 10. Installation
+## 11. Installation
 
 ### System Requirements
 
@@ -755,7 +959,7 @@ Visual_Inertial_Odometry/
 | Python | 3.10 | 3.12 |
 | GPU | not required | not required |
 
-No deep-learning dependencies. The KLT pipeline runs in real-time on CPU.
+Core runtime is CPU-friendly (`numpy`, OpenCV, ROS 2 Python). This repo's `requirements.txt` currently also lists `torch` / `torchvision` and a commented LightGlue install path for separate experimentation workflows.
 
 ### Python Dependencies
 
@@ -764,6 +968,8 @@ No deep-learning dependencies. The KLT pipeline runs in real-time on CPU.
 - `PyYAML`
 - `matplotlib` (optional, for `evaluate_trajectory.py` plots)
 - `rosbag2_py` (for bag conversion scripts)
+- `rich` (optional, for formatted `compare_logs.py` tables)
+- `torch`, `torchvision` (listed in `requirements.txt`, optional for the core KLT pipeline)
 
 ### Build Steps
 
@@ -789,8 +995,8 @@ Convert raw datasets to ROS 2 bags:
 ```bash
 # EuRoC MAV
 python bag_utils/euroc_to_bag.py \
-    --dataset dataset/mav0 \
-    --output bags/euroc_mav0
+  --dataset dataset/MH_01_easy/MH_01_easy/mav0 \
+  --output bags/mh_01_easy
 
 # UZH FPV indoor (applies fisheye undistortion at write time)
 python bag_utils/uzh_to_bag.py \
@@ -802,12 +1008,12 @@ Both scripts validate existing bags and only rebuild topics with incorrect messa
 
 ---
 
-## 11. Running the Pipeline
+## 12. Running the Pipeline
 
 ### Terminal A -- Play the bag
 
 ```bash
-ros2 bag play bags/euroc_mav0 --rate 0.5 --clock
+ros2 bag play bags/mh_01_easy --rate 0.5 --clock
 ```
 
 - `--rate 0.5` plays at half speed (remove once timing is confirmed)
@@ -815,9 +1021,14 @@ ros2 bag play bags/euroc_mav0 --rate 0.5 --clock
 
 ### Terminal B -- Launch the pipeline
 
-**EuRoC (default config):**
+**EuRoC with ESKF (default):**
 ```bash
 ros2 launch vio_pipeline full_pipeline.launch.py
+```
+
+**EuRoC with FGO backend:**
+```bash
+ros2 launch vio_pipeline full_pipeline.launch.py use_fgo:=true
 ```
 
 **UZH indoor:**
@@ -826,19 +1037,21 @@ ros2 launch vio_pipeline full_pipeline.launch.py \
     config_file:=/path/to/uzh_indoor_params.yaml
 ```
 
-**With GPS fusion (standalone mode):**
+**With GPS simulator enabled (standalone profile):**
 ```bash
 ros2 launch vio_pipeline full_pipeline.launch.py \
     use_gps:=true \
     gps_mode:=standalone
 ```
 
-**With GPS fusion (RTK mode):**
+**With GPS simulator enabled (RTK profile):**
 ```bash
 ros2 launch vio_pipeline full_pipeline.launch.py \
     use_gps:=true \
     gps_mode:=rtk
 ```
+
+At the moment, these launch commands enable GPS simulation topics; ESKF GPS correction is still disabled by the hardcoded `"use_gps": False` launch parameter described in Section 7.
 
 **With TF publisher:**
 ```bash
@@ -851,16 +1064,22 @@ ros2 launch vio_pipeline full_pipeline.launch.py \
 | Argument | Default | Description |
 |---|---|---|
 | `config_file` | `euroc_params.yaml` (from package share) | Path to dataset calibration YAML |
+| `pipeline_params_file` | `pipeline_params.yaml` (from package share) | Path to centralized tunable parameters |
 | `use_sim_time` | `true` | Use `/clock` from bag playback |
-| `use_gps` | `false` | Launch `GpsSimulatorNode` and enable ESKF GPS updates |
+| `use_fgo` | `false` | Use FGO sliding-window backend instead of ESKF |
+| `use_rectifier` | `true` | Launch `StereoRectifierNode` for stereo rectification |
+| `use_gps` | `false` | Launch `GpsSimulatorNode` (ESKF GPS update currently disabled in launch code) |
 | `gps_mode` | `standalone` | GPS profile: `standalone` or `rtk` |
 | `use_tf_publisher` | `false` | Launch `TfPublisherNode` for TF2 tree |
 
 ### Terminal C -- Inspect output
 
 ```bash
-# Live fused pose
+# Live fused pose (ESKF mode)
 ros2 topic echo /eskf/pose
+
+# Live fused pose (FGO mode)
+ros2 topic echo /fgo/pose
 
 # Compare rates
 ros2 topic hz /vio/pose /eskf/pose
@@ -877,9 +1096,17 @@ After the bag finishes and CSVs are written to `tmp/`:
 python evaluate_trajectory.py --input tmp/ --logs logs/
 ```
 
+### Compare multiple runs
+
+`compare_logs.py` parses `logs/*/summary.txt` and ranks runs by ATE.
+
+```bash
+python compare_logs.py --logs-dir logs --sort eskf_ate
+```
+
 ---
 
-## 12. ROS 2 Topics and Parameters
+## 13. ROS 2 Topics and Parameters
 
 ### Published Topics
 
@@ -890,10 +1117,15 @@ python evaluate_trajectory.py --input tmp/ --logs logs/
 | `/vio/odometry` | `Odometry` | PoseEstimation | Visual odometry (frame: map, child: base_link) |
 | `/vio/rpy` | `Vector3Stamped` | PoseEstimation | Roll/pitch/yaw in degrees |
 | `/features/temporal_viz` | `Image` | PoseEstimation | KLT motion trail visualisation |
+| `/cam0/image_rect` | `Image` | StereoRectifier | Rectified left image |
+| `/cam1/image_rect` | `Image` | StereoRectifier | Rectified right image |
 | `/eskf/odometry` | `Odometry` | ESKF | Fused pose + velocity (200 Hz) |
 | `/eskf/pose` | `PoseStamped` | ESKF | Fused pose |
 | `/eskf/path` | `Path` | ESKF | Fused trajectory |
 | `/eskf/rpy` | `Vector3Stamped` | ESKF | Fused roll/pitch/yaw in degrees |
+| `/fgo/odometry` | `Odometry` | FGO | Optimized pose + velocity (~20 Hz) |
+| `/fgo/pose` | `PoseStamped` | FGO | Optimized pose |
+| `/fgo/path` | `Path` | FGO | Optimized trajectory |
 | `/imu/processed` | `Imu` | ImuProcessing | Bias-corrected + LPF IMU (200 Hz) |
 | `/imu/odometry` | `Odometry` | ImuProcessing | IMU dead-reckoning (drifts) |
 | `/gt_pub/pose` | `PoseStamped` | GroundTruth | Aligned ground-truth pose |
@@ -910,12 +1142,13 @@ python evaluate_trajectory.py --input tmp/ --logs logs/
 
 | Topic | Type | Subscribers |
 |---|---|---|
-| `/cam0/image_raw` | `Image` | PoseEstimation, FeatureTracking |
-| `/cam1/image_raw` | `Image` | PoseEstimation, FeatureTracking |
-| `/imu0` | `Imu` | ImuProcessing, ESKF (raw gravity buffer) |
-| `/imu/processed` | `Imu` | ESKF |
-| `/vio/odometry` | `Odometry` | ESKF, DebugLogger |
+| `/cam0/image_raw` | `Image` | PoseEstimation, StereoRectifier, FeatureTracking |
+| `/cam1/image_raw` | `Image` | PoseEstimation, StereoRectifier, FeatureTracking |
+| `/imu0` | `Imu` | ImuProcessing, ESKF (raw gravity buffer), FGO (raw gravity buffer) |
+| `/imu/processed` | `Imu` | ESKF, FGO |
+| `/vio/odometry` | `Odometry` | ESKF, FGO, DebugLogger |
 | `/eskf/odometry` | `Odometry` | TfPublisher, DebugLogger |
+| `/fgo/odometry` | `Odometry` | DebugLogger |
 | `/gt/pose` | `PoseStamped` | GroundTruth (configurable via `gt_topic` param) |
 | `/gt_pub/pose` | `PoseStamped` | GpsSimulator |
 | `/gt_pub/odometry` | `Odometry` | DebugLogger |
@@ -932,6 +1165,12 @@ python evaluate_trajectory.py --input tmp/ --logs logs/
 | `min_inlier_ratio` | `0.4` | Min RANSAC inlier fraction to accept pose |
 | `max_translation` | `0.5` | Max accepted per-frame translation (m) |
 | `max_rotation_deg` | `30.0` | Max accepted per-frame rotation (deg) |
+| `kf_min_translation` | `0.03` | Min accumulated translation for keyframe (m) |
+| `kf_min_rotation_deg` | `2.0` | Min accumulated rotation for keyframe (deg) |
+| `kf_max_frames` | `5` | Max frames between keyframes |
+| `pose_cov_pos_base` | `0.03` | Base position std for dynamic covariance (m) |
+| `pose_cov_ang_base` | `0.03` | Base rotation std for dynamic covariance (rad) |
+| `max_epipolar_err` | `2.0` | Max stereo epipolar line error (px, rectified mode) |
 
 ### ImuProcessingNode Parameters
 
@@ -946,21 +1185,39 @@ python evaluate_trajectory.py --input tmp/ --logs logs/
 
 ### EskfNode Parameters
 
-| Parameter | Default | Launch override | Description |
-|---|---|---|---|
-| `config_path` | `""` | from `config_file` arg | IMU noise figures |
-| `meas_pos_std` | `0.05` | `0.1` | VIO position noise 1-sigma (m) |
-| `meas_ang_std` | `0.02` | `0.2` | VIO rotation noise 1-sigma (rad) |
-| `init_pos_std` | `1.0` | `1.0` | Initial position uncertainty (m) |
-| `init_vel_std` | `1.0` | `0.3` | Initial velocity uncertainty (m/s) |
-| `init_att_std` | `0.1` | `0.05` | Initial attitude uncertainty (rad) |
-| `init_ba_std` | `0.01` | `0.02` | Initial accel-bias uncertainty (m/s^2) |
-| `init_bg_std` | `0.001` | `5e-4` | Initial gyro-bias uncertainty (rad/s) |
-| `max_dt` | `0.1` | `0.1` | Max IMU dt before discard (s) |
-| `use_gps` | `true` | `true` | Enable GPS measurement updates |
-| `gps_pos_std_h` | `2.0` | from `gps_profiles.yaml` | GPS horizontal 1-sigma (m) |
-| `gps_pos_std_v` | `4.0` | from `gps_profiles.yaml` | GPS vertical 1-sigma (m) |
-| `gps_gate_chi2` | `7.815` | from `gps_profiles.yaml` | Mahalanobis gate threshold (0 = disabled) |
+| Parameter | Default | Description |
+|---|---|---|
+| `config_path` | `""` | IMU noise figures |
+| `meas_pos_std` | `0.05` | VIO position noise 1-sigma (m) |
+| `meas_ang_std` | `0.05` | VIO rotation noise 1-sigma (rad) |
+| `init_pos_std` | `1.0` | Initial position uncertainty (m) |
+| `init_vel_std` | `0.3` | Initial velocity uncertainty (m/s) |
+| `init_att_std` | `0.05` | Initial attitude uncertainty (rad) |
+| `init_ba_std` | `0.02` | Initial accel-bias uncertainty (m/s^2) |
+| `init_bg_std` | `5.0e-4` | Initial gyro-bias uncertainty (rad/s) |
+| `max_dt` | `0.1` | Max IMU dt before discard (s) |
+| `use_gps` | `false` | Enable GPS measurement updates |
+| `gps_pos_std_h` | `2.0` | GPS horizontal 1-sigma (m) |
+| `gps_pos_std_v` | `4.0` | GPS vertical 1-sigma (m) |
+| `gps_gate_chi2` | `7.815` | Mahalanobis gate threshold (0 = disabled) |
+
+### FgoBackendNode Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `config_path` | `""` | IMU noise figures |
+| `window_size` | `10` | Number of keyframes in sliding window |
+| `lm_max_iter` | `8` | Max Levenberg-Marquardt iterations per keyframe |
+| `lm_lambda_init` | `1.0e-3` | Initial LM damping factor |
+| `imu_noise_scale` | `20.0` | IMU white noise inflation factor for preintegration |
+| `min_gravity_samples` | `100` | Min raw IMU samples for gravity estimation |
+| `vo_pos_std` | `0.05` | Fallback VO position noise (m) |
+| `vo_ang_std` | `0.05` | Fallback VO rotation noise (rad) |
+| `prior_pos_std` | `0.01` | Prior on first keyframe position (m) |
+| `prior_vel_std` | `1.0` | Prior on first keyframe velocity (m/s) |
+| `prior_att_std` | `0.01` | Prior on first keyframe attitude (rad) |
+| `prior_ba_std` | `0.02` | Prior on accel bias (m/s^2) |
+| `prior_bg_std` | `5.0e-4` | Prior on gyro bias (rad/s) |
 
 ### GpsSimulatorNode Parameters
 
@@ -999,10 +1256,25 @@ python evaluate_trajectory.py --input tmp/ --logs logs/
 | Parameter | Default | Description |
 |---|---|---|
 | `output_dir` | `<project_root>/tmp` | Directory for CSV output files |
+| `pipeline_params_file` | `""` | Path to pipeline_params.yaml (copied to output for reproducibility) |
 
 ---
 
-## 13. Configuration Files
+## 14. Configuration Files
+
+### `pipeline_params.yaml`
+
+**Centralized tunable parameters** for all pipeline nodes. The launch file reads this single file and distributes values to each node. Edit here to change behaviour -- no need to touch launch files or Python nodes.
+
+Sections:
+
+| Section | Controls |
+|---|---|
+| `eskf` | ESKF measurement noise, initial covariance, max dt |
+| `imu` | IMU preprocessing: init duration, LPF cutoffs |
+| `feature_tracking` | Shi-Tomasi + KLT parameters |
+| `vio` | PnP thresholds, keyframe selection, dynamic covariance |
+| `fgo` | FGO window size, LM optimizer, IMU noise scaling, priors |
 
 ### `euroc_params.yaml`
 
@@ -1033,7 +1305,7 @@ imu:
   rate_hz: 200
   T_BS: [identity]          # IMU = body frame for EuRoC
 
-gravity: [0.0, 0.0, -9.81]  # overridden by ESKF gravity estimator
+gravity: [0.0, 0.0, -9.81]  # overridden by ESKF/FGO gravity estimator
 ```
 
 ### `uzh_indoor_params.yaml`
@@ -1055,5 +1327,7 @@ Select a profile at launch:
 ros2 launch vio_pipeline full_pipeline.launch.py use_gps:=true gps_mode:=standalone
 ros2 launch vio_pipeline full_pipeline.launch.py use_gps:=true gps_mode:=rtk
 ```
+
+These commands currently configure the simulator profile; enabling ESKF GPS updates additionally requires changing the hardcoded ESKF `use_gps` launch parameter in `full_pipeline.launch.py`.
 
 To add a new profile, add a top-level key to `gps_profiles.yaml` with the same `simulator` / `eskf` structure and reference it via `gps_mode:=<name>`.

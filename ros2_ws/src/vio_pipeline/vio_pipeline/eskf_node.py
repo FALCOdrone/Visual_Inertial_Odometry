@@ -464,6 +464,15 @@ class EskfNode(Node):
         )
         q_meas /= np.linalg.norm(q_meas)
 
+        # Use per-measurement covariance if VIO populated it; else fall back to static R_meas
+        cov_flat = msg.pose.covariance  # 36-element flat row-major 6×6
+        if any(c != 0.0 for c in cov_flat):
+            pos_var = [cov_flat[0], cov_flat[7],  cov_flat[14]]
+            ang_var = [cov_flat[21], cov_flat[28], cov_flat[35]]
+            R_meas_local = np.diag(pos_var + ang_var)
+        else:
+            R_meas_local = self._R_meas
+
         if self._state == self._UNINIT:
             # Seed nominal state from the first VIO measurement.
             self._p = p_meas.copy()
@@ -501,7 +510,7 @@ class EskfNode(Node):
             )
             return
 
-        self._update(p_meas, q_meas)
+        self._update(p_meas, q_meas, R_meas_local)
 
     # ── GPS update ─────────────────────────────────────────────────────────────
 
@@ -627,14 +636,15 @@ class EskfNode(Node):
 
     # ── Update step ────────────────────────────────────────────────────────────
 
-    def _update(self, p_meas: np.ndarray, q_meas: np.ndarray) -> None:
+    def _update(self, p_meas: np.ndarray, q_meas: np.ndarray,
+                R_meas: np.ndarray | None = None) -> None:
         """
         VIO-rate measurement update (Joseph-form EKF update).
 
         Innovation
         ----------
           z_p = p_meas − p_nom                      (position, 3-DOF)
-          z_θ = Log(R_nom.T @ R_meas)               (orientation, 3-DOF, body frame)
+          z_θ = Log(R_nom.T @ R_meas_rot)           (orientation, 3-DOF, body frame)
           z   = [z_p ; z_θ]   ∈ ℝ⁶
 
         Measurement Jacobian H (6×15)
@@ -642,12 +652,15 @@ class EskfNode(Node):
           H[0:3, 0:3] = I₃   ∂p_meas/∂δp
           H[3:6, 6:9] = I₃   ∂θ_meas/∂δθ  (first-order, error in body frame)
         """
+        if R_meas is None:
+            R_meas = self._R_meas
+
         R_nom = _quat_to_rot(self._q)
-        R_meas = _quat_to_rot(q_meas)
+        R_meas_rot = _quat_to_rot(q_meas)
 
         # Innovation
         z_p = p_meas - self._p
-        z_r = _log_so3(R_nom.T @ R_meas)  # rotation error expressed in body frame
+        z_r = _log_so3(R_nom.T @ R_meas_rot)  # rotation error expressed in body frame
         z = np.concatenate([z_p, z_r])  # (6,)
 
         # Measurement Jacobian
@@ -656,7 +669,7 @@ class EskfNode(Node):
         H[3:6, 6:9] = np.eye(3)
 
         # Innovation covariance and Kalman gain
-        S = H @ self._P @ H.T + self._R_meas  # (6×6)
+        S = H @ self._P @ H.T + R_meas  # (6×6)
         K = self._P @ H.T @ np.linalg.solve(S.T, np.eye(6)).T  # (15×6)
 
         # Error-state estimate
@@ -673,7 +686,7 @@ class EskfNode(Node):
         # Covariance update — Joseph form for numerical stability:
         #   P ← (I−KH)·P·(I−KH)ᵀ + K·R·Kᵀ
         IKH = np.eye(15) - K @ H
-        self._P = IKH @ self._P @ IKH.T + K @ self._R_meas @ K.T
+        self._P = IKH @ self._P @ IKH.T + K @ R_meas @ K.T
 
         # Enforce exact symmetry to suppress floating-point drift
         self._P = (self._P + self._P.T) * 0.5

@@ -81,6 +81,11 @@ class PoseEstimationNode(Node):
         self.declare_parameter("win_size_h", 14)
         self.declare_parameter("max_level", 3)
         self.declare_parameter("max_epipolar_err", 2.0)
+        self.declare_parameter("kf_min_translation",  0.05)
+        self.declare_parameter("kf_min_rotation_deg", 3.0)
+        self.declare_parameter("kf_max_frames",       10)
+        self.declare_parameter("pose_cov_pos_base",   0.05)
+        self.declare_parameter("pose_cov_ang_base",   0.05)
 
         config_path = self.get_parameter("config_path").value
         self.min_tracks = self.get_parameter("min_tracks").value
@@ -89,6 +94,15 @@ class PoseEstimationNode(Node):
         self.min_inlier_ratio = self.get_parameter("min_inlier_ratio").value
         self.max_translation = self.get_parameter("max_translation").value
         self.max_rotation_deg = self.get_parameter("max_rotation_deg").value
+        self._kf_min_translation  = self.get_parameter("kf_min_translation").value
+        self._kf_min_rotation_deg = self.get_parameter("kf_min_rotation_deg").value
+        self._kf_max_frames       = self.get_parameter("kf_max_frames").value
+        self._pose_cov_pos_base   = self.get_parameter("pose_cov_pos_base").value
+        self._pose_cov_ang_base   = self.get_parameter("pose_cov_ang_base").value
+
+        self._T_kf_world_cam0   = None   # world pose at last published keyframe
+        self._frames_since_kf   = 0      # frames elapsed since last KF publish
+        self._last_inlier_ratio = 1.0    # from most recent successful PnP
 
         self.load_config(config_path)
         self._setup_camera_params()
@@ -271,7 +285,28 @@ class PoseEstimationNode(Node):
         # T_rel: p_curr = T_rel @ p_prev  →  cam0_curr in world frame:
         self.T_world_cam0 = self.T_world_cam0 @ np.linalg.inv(T_rel)
 
-        self._publish_pose(stamp, ts_ns)
+        if self._T_kf_world_cam0 is None:
+            # First successful PnP — always publish
+            self._T_kf_world_cam0 = self.T_world_cam0.copy()
+            self._frames_since_kf = 0
+            self._publish_pose(stamp, ts_ns)
+        else:
+            delta_T = np.linalg.inv(self._T_kf_world_cam0) @ self.T_world_cam0
+            trans     = np.linalg.norm(delta_T[:3, 3])
+            cos_angle = np.clip((np.trace(delta_T[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
+            angle_deg = np.degrees(np.arccos(cos_angle))
+            self._frames_since_kf += 1
+
+            if (trans     >= self._kf_min_translation
+                    or angle_deg >= self._kf_min_rotation_deg
+                    or self._frames_since_kf >= self._kf_max_frames):
+                self._T_kf_world_cam0 = self.T_world_cam0.copy()
+                self._frames_since_kf = 0
+                self._publish_pose(stamp, ts_ns)
+            else:
+                self.get_logger().debug(
+                    f"ts={ts_ns} | skip KF (t={trans:.3f}m r={angle_deg:.1f}° f={self._frames_since_kf})"
+                )
 
     def _undistort_points(self, pts, K, dist):
         """Undistort 2D keypoints back into ideal pixel coordinates."""
@@ -335,6 +370,8 @@ class PoseEstimationNode(Node):
                 f"ts={ts_ns} | inlier ratio too low ({inlier_ratio:.2f} < {self.min_inlier_ratio})"
             )
             return None
+
+        self._last_inlier_ratio = inlier_ratio
 
         # Refine on inliers with iterative non-linear optimisation
         inlier_idx = inliers.ravel()
@@ -424,6 +461,17 @@ class PoseEstimationNode(Node):
         odom_msg.header.frame_id = "map"
         odom_msg.child_frame_id = "base_link"
         odom_msg.pose.pose = pose_msg.pose
+        _ir  = max(self._last_inlier_ratio, 0.1)
+        _pv  = (self._pose_cov_pos_base / _ir) ** 2
+        _av  = (self._pose_cov_ang_base / _ir) ** 2
+        cov  = [0.0] * 36
+        cov[0]  = _pv   # x·x
+        cov[7]  = _pv   # y·y
+        cov[14] = _pv   # z·z
+        cov[21] = _av   # roll·roll
+        cov[28] = _av   # pitch·pitch
+        cov[35] = _av   # yaw·yaw
+        odom_msg.pose.covariance = cov
         self.odom_pub.publish(odom_msg)
 
         roll, pitch, yaw = _rot_to_rpy(R)

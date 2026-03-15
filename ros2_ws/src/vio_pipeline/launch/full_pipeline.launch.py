@@ -38,10 +38,12 @@ def _make_nodes(context, *args, **kwargs):
     use_gps       = LaunchConfiguration("use_gps").perform(context)
     gps_mode      = LaunchConfiguration("gps_mode").perform(context).lower()
     use_rectifier = LaunchConfiguration("use_rectifier").perform(context)
+    use_fgo       = LaunchConfiguration("use_fgo").perform(context)
     use_sim_time_bool  = use_sim_time.lower()  in ("true", "1", "yes")
     use_tf_bool        = use_tf.lower()        in ("true", "1", "yes")
     use_gps_bool       = use_gps.lower()       in ("true", "1", "yes")
     use_rectifier_bool = use_rectifier.lower() in ("true", "1", "yes")
+    use_fgo_bool       = use_fgo.lower()       in ("true", "1", "yes")
 
     # Load GPS profiles from YAML
     pkg_share = get_package_share_directory("vio_pipeline")
@@ -68,6 +70,7 @@ def _make_nodes(context, *args, **kwargs):
     imu_p  = pp["imu"]
     ft_p   = pp["feature_tracking"]
     vio_p  = pp["vio"]
+    fgo_p  = pp.get("fgo", {})
 
     output_dir = os.path.normpath(
         os.path.join(
@@ -101,6 +104,11 @@ def _make_nodes(context, *args, **kwargs):
                     "min_inlier_ratio":         float(vio_p["min_inlier_ratio"]),
                     "max_translation":          float(vio_p["max_translation"]),
                     "max_rotation_deg":         float(vio_p["max_rotation_deg"]),
+                    "kf_min_translation":  float(vio_p["kf_min_translation"]),
+                    "kf_min_rotation_deg": float(vio_p["kf_min_rotation_deg"]),
+                    "kf_max_frames":       int(vio_p["kf_max_frames"]),
+                    "pose_cov_pos_base":   float(vio_p["pose_cov_pos_base"]),
+                    "pose_cov_ang_base":   float(vio_p["pose_cov_ang_base"]),
                 }
             ],
         ),
@@ -135,27 +143,8 @@ def _make_nodes(context, *args, **kwargs):
                 }
             ],
         ),
-        # ESKF Node
-        # ── Measurement noise ─────────────────────────────────────────────────
-        # meas_pos_std  [m]    1-σ noise on VIO position.
-        #   Lower  → filter trusts VIO position more, tracks it closely.
-        #   Higher → filter relies on IMU integration; smooth but drifts faster.
-        #   Typical range: 0.02 (good VIO) … 0.5 (noisy/sparse VIO).
-        #
-        # meas_ang_std  [rad]  1-σ noise on VIO orientation (≈ degrees × π/180).
-        #   Lower  → filter trusts VIO rotation more.
-        #   Higher → IMU gyro integration dominates attitude; fine for short runs.
-        #   Typical range: 0.01 (≈0.6°) … 0.1 (≈5.7°).
-        #
-        # ── Initial covariance (P₀ diagonal) ─────────────────────────────────
-        # These seed the filter's uncertainty at t=0.  They only affect the
-        # first few VIO updates; after ~5 updates the filter self-calibrates.
-        #
-        # ── Numerical guard ───────────────────────────────────────────────────
-        # max_dt  [s]  Discard IMU samples whose dt exceeds this threshold.
-        #   Prevents covariance blow-up after bag gaps or node restarts.
-        #   Should be ≥ 2× nominal IMU period (5 ms → 0.01 s minimum).
-        Node(
+        # ESKF Node (skipped when use_fgo:=true)
+        *([Node(
             package="vio_pipeline",
             executable="eskf_node",
             name="eskf_node",
@@ -164,7 +153,6 @@ def _make_nodes(context, *args, **kwargs):
                 {
                     "config_path": config_file,
                     "use_sim_time": use_sim_time_bool,
-                    # All ESKF params loaded from pipeline_params.yaml
                     "meas_pos_std": float(eskf_p["meas_pos_std"]),
                     "meas_ang_std": float(eskf_p["meas_ang_std"]),
                     "init_pos_std": float(eskf_p["init_pos_std"]),
@@ -173,14 +161,38 @@ def _make_nodes(context, *args, **kwargs):
                     "init_ba_std":  float(eskf_p["init_ba_std"]),
                     "init_bg_std":  float(eskf_p["init_bg_std"]),
                     "max_dt":       float(eskf_p["max_dt"]),
-                    # GPS fusion — profile set by gps_mode launch argument
                     "use_gps":       False,
                     "gps_pos_std_h": gps_eskf["pos_std_h"],
                     "gps_pos_std_v": gps_eskf["pos_std_v"],
                     "gps_gate_chi2": gps_eskf["gate_chi2"],
                 }
             ],
-        ),
+        )] if not use_fgo_bool else []),
+        # FGO Backend Node (use_fgo:=true to enable)
+        *([Node(
+            package="vio_pipeline",
+            executable="fgo_backend_node",
+            name="fgo_backend_node",
+            output="screen",
+            parameters=[
+                {
+                    "config_path": config_file,
+                    "use_sim_time": use_sim_time_bool,
+                    "window_size":    int(fgo_p.get("window_size", 10)),
+                    "lm_max_iter":    int(fgo_p.get("lm_max_iter", 8)),
+                    "lm_lambda_init": float(fgo_p.get("lm_lambda_init", 1e-3)),
+                    "imu_noise_scale": float(fgo_p.get("imu_noise_scale", 20.0)),
+                    "min_gravity_samples": int(fgo_p.get("min_gravity_samples", 100)),
+                    "vo_pos_std":     float(fgo_p.get("vo_pos_std", 0.05)),
+                    "vo_ang_std":     float(fgo_p.get("vo_ang_std", 0.05)),
+                    "prior_pos_std":  float(fgo_p.get("prior_pos_std", 0.01)),
+                    "prior_vel_std":  float(fgo_p.get("prior_vel_std", 1.0)),
+                    "prior_att_std":  float(fgo_p.get("prior_att_std", 0.01)),
+                    "prior_ba_std":   float(fgo_p.get("prior_ba_std", 0.02)),
+                    "prior_bg_std":   float(fgo_p.get("prior_bg_std", 5e-4)),
+                }
+            ],
+        )] if use_fgo_bool else []),
         # TF Publisher (use_tf_publisher:=true to enable)
         *([Node(
             package="vio_pipeline",
@@ -299,6 +311,11 @@ def generate_launch_description():
                 "use_gps",
                 default_value="false",
                 description="Launch gps_simulator_node (samples /gt_pub/pose, publishes /gps/fix)",
+            ),
+            DeclareLaunchArgument(
+                "use_fgo",
+                default_value="false",
+                description="Use FGO sliding-window backend instead of ESKF",
             ),
             DeclareLaunchArgument(
                 "gps_mode",

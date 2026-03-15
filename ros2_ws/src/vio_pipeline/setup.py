@@ -32,6 +32,7 @@ setup(
             "tf_publisher_node = vio_pipeline.tf_publisher_node:main",
             "gps_simulator_node = vio_pipeline.gps_simulator_node:main",
             "stereo_rectifier_node = vio_pipeline.stereo_rectifier_node:main",
+            "fgo_backend_node = vio_pipeline.fgo_backend_node:main",
         ],
     },
 )

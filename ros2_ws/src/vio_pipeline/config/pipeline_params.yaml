@@ -31,7 +31,7 @@ feature_tracking:
   max_corners:      100    # cap on Shi-Tomasi corners per frame
   quality_level:    0.5    # fraction of strongest corner score; higher → fewer but stronger
   min_distance:     20     # minimum pixel gap between corners
-  win_size:         [14, 14]  # KLT patch size [w, h] at each pyramid level
+  win_size:         [21, 21]  # KLT patch size [w, h] at each pyramid level
   max_level:        3      # pyramid depth (0 = no pyramid)
   max_epipolar_err: 2.0    # px — max allowed y-offset between rectified stereo matches
 
@@ -43,3 +43,23 @@ vio:
   min_inlier_ratio:         0.4   # RANSAC inliers / candidates; below → reject frame
   max_translation:          0.5   # m/frame — motion sanity check
   max_rotation_deg:         30.0  # deg/frame — rotation sanity check
+  kf_min_translation: 0.03   # m   — min accumulated translation from last KF to publish
+  kf_min_rotation_deg: 2.0   # deg — min accumulated rotation from last KF to publish
+  kf_max_frames: 5            # failsafe: publish at least every N frames (5 = 0.25 s at 20 Hz)
+  pose_cov_pos_base: 0.03    # m   — base 1-σ; at inlier_ratio=1.0 matches static meas_pos_std
+  pose_cov_ang_base: 0.03    # rad — base 1-σ; at inlier_ratio=1.0 matches static meas_ang_std
+
+# ── Factor Graph Optimization (FGO) backend ────────────────────────────────
+fgo:
+  window_size:     10       # keyframes in sliding window
+  lm_max_iter:     8        # LM iterations per keyframe arrival
+  lm_lambda_init:  1.0e-3   # initial LM damping
+  imu_noise_scale: 20.0     # inflate IMU white noise for preintegration (standard for FGO)
+  min_gravity_samples: 100  # wait for N raw IMU samples before init (gravity estimation)
+  vo_pos_std:      0.05     # m   — fallback if VIO covariance is zero
+  vo_ang_std:      0.05     # rad — fallback if VIO covariance is zero
+  prior_pos_std:   0.01     # m   — prior on first keyframe position
+  prior_vel_std:   1.0      # m/s — prior on first keyframe velocity
+  prior_att_std:   0.01     # rad — prior on first keyframe attitude
+  prior_ba_std:    0.02     # m/s² — prior on accel bias
+  prior_bg_std:    5.0e-4   # rad/s — prior on gyro bias

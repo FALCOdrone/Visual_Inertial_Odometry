@@ -117,6 +117,7 @@ class DebugLoggerNode(Node):
             ("imu_processed.csv",  imu_fields),
             ("pose_vio.csv",       pose_fields),
             ("pose_eskf.csv",      pose_fields),
+            ("pose_fgo.csv",       pose_fields),
             ("pose_imu_dr.csv",    pose_fields),
             ("pose_gt.csv",        gt_fields),
         ]:
@@ -144,6 +145,7 @@ class DebugLoggerNode(Node):
         self.create_subscription(Odometry, "/imu/odometry",    self._cb_imu_dr,   qos_be)
         self.create_subscription(Odometry, "/vio/odometry",    self._cb_vio,      qos_be)
         self.create_subscription(Odometry, "/eskf/odometry",   self._cb_eskf,     qos_be)
+        self.create_subscription(Odometry, "/fgo/odometry",    self._cb_fgo,      qos_be)
         self.create_subscription(Odometry, "/gt_pub/odometry", self._cb_gt,       qos_be)
 
         signal.signal(signal.SIGTERM, self._on_sigterm)
@@ -296,6 +298,9 @@ class DebugLoggerNode(Node):
 
     def _cb_eskf(self,   msg: Odometry) -> None:
         self._write_pose(self._writers["pose_eskf.csv"],   msg)
+
+    def _cb_fgo(self,    msg: Odometry) -> None:
+        self._write_pose(self._writers["pose_fgo.csv"],    msg)
 
     def _cb_imu_dr(self, msg: Odometry) -> None:
         self._write_pose(self._writers["pose_imu_dr.csv"], msg)
