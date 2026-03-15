@@ -1,0 +1,45 @@
+# pipeline_params.yaml
+# ====================
+# All tunable VIO pipeline parameters in one place.
+# The launch file reads this file and passes each value to the appropriate node.
+# Edit here to change behaviour — no need to touch launch files or Python nodes.
+
+# ── ESKF measurement noise & initial covariance ───────────────────────────────
+eskf:
+  # Measurement noise — how much to trust each VIO update
+  meas_pos_std:  0.05    # m    — 1-σ VIO position noise (sweet spot; 0.03 overcorrects)
+  meas_ang_std:  0.05    # rad  — 1-σ VIO rotation noise (~2.9°; rectified VIO ≈ 0.5-2° RMS)
+
+  # Initial covariance (P₀ diagonal) — affects first few updates only
+  init_pos_std:  1.0     # m    — generous; corrected on first VIO update
+  init_vel_std:  0.3     # m/s  — drone starts stationary
+  init_att_std:  0.05    # rad  — ~2.9°; gravity-align from static buffer
+  init_ba_std:   0.02    # m/s² — residual after static bias removal
+  init_bg_std:   5.0e-4  # rad/s — residual gyro drift
+
+  # Numerical guard
+  max_dt:        0.1     # s    — skip IMU steps > 100 ms (prevents covariance blow-up)
+
+# ── IMU preprocessing ─────────────────────────────────────────────────────────
+imu:
+  init_duration:     0.0   # s   — static window for bias/gravity initialisation
+  gyro_lpf_cutoff:  15.0   # Hz  — Butterworth LPF cutoff for gyroscope
+  accel_lpf_cutoff: 10.0   # Hz  — Butterworth LPF cutoff for accelerometer
+
+# ── KLT feature tracker ───────────────────────────────────────────────────────
+feature_tracking:
+  max_corners:      100    # cap on Shi-Tomasi corners per frame
+  quality_level:    0.5    # fraction of strongest corner score; higher → fewer but stronger
+  min_distance:     20     # minimum pixel gap between corners
+  win_size:         [14, 14]  # KLT patch size [w, h] at each pyramid level
+  max_level:        3      # pyramid depth (0 = no pyramid)
+  max_epipolar_err: 2.0    # px — max allowed y-offset between rectified stereo matches
+
+# ── VIO pose estimation ───────────────────────────────────────────────────────
+vio:
+  min_tracks:               10    # minimum tracked features to attempt PnP
+  circular_check_threshold: 2.0   # px — forward-backward KLT consistency threshold
+  max_depth:                30.0  # m  — discard triangulated points beyond this
+  min_inlier_ratio:         0.4   # RANSAC inliers / candidates; below → reject frame
+  max_translation:          0.5   # m/frame — motion sanity check
+  max_rotation_deg:         30.0  # deg/frame — rotation sanity check

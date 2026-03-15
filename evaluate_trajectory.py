@@ -22,6 +22,8 @@ Usage (run from project root):
 
 import argparse
 import csv
+import glob
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -494,6 +496,16 @@ def main():
 
         plot_rpe_boxplot(rpe_eskf, rpe_vio, out_dir / "rpe_boxplot.png")
         print("  rpe_boxplot.png")
+
+    # ── Archive raw data into the log dir ────────────────────────────────────
+    print("Archiving raw data...")
+    for csv_path in glob.glob(str(input_dir / "*.csv")):
+        shutil.copy2(csv_path, out_dir)
+        print(f"  {Path(csv_path).name}")
+    params_src = input_dir / "pipeline_params.yaml"
+    if params_src.exists():
+        shutil.copy2(params_src, out_dir)
+        print("  pipeline_params.yaml")
 
     print(f"\nAll results saved to: {out_dir}/")
 

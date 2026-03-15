@@ -63,14 +63,24 @@ def _rot_to_rpy(R):
 class PoseEstimationNode(Node):
     def __init__(self):
         super().__init__("pose_estimation_node")
+        cv2.setRNGSeed(0)  # make solvePnPRansac deterministic across runs
 
         self.declare_parameter("config_path", "")
+        # VIO pose estimation params
         self.declare_parameter("min_tracks", 10)
         self.declare_parameter("circular_check_threshold", 2.0)
         self.declare_parameter("max_depth", 30.0)          # metres — discard far points
         self.declare_parameter("min_inlier_ratio", 0.4)    # RANSAC inliers / candidates
         self.declare_parameter("max_translation", 0.5)     # metres per frame
         self.declare_parameter("max_rotation_deg", 30.0)   # degrees per frame
+        # Feature tracking params (forwarded to FeatureExtractor)
+        self.declare_parameter("max_corners", 200)
+        self.declare_parameter("quality_level", 0.5)
+        self.declare_parameter("min_distance", 20)
+        self.declare_parameter("win_size_w", 14)
+        self.declare_parameter("win_size_h", 14)
+        self.declare_parameter("max_level", 3)
+        self.declare_parameter("max_epipolar_err", 2.0)
 
         config_path = self.get_parameter("config_path").value
         self.min_tracks = self.get_parameter("min_tracks").value
@@ -83,7 +93,16 @@ class PoseEstimationNode(Node):
         self.load_config(config_path)
         self._setup_camera_params()
 
-        self.extractor = FeatureExtractor()
+        win_w = self.get_parameter("win_size_w").value
+        win_h = self.get_parameter("win_size_h").value
+        self.extractor = FeatureExtractor(
+            max_corners      = self.get_parameter("max_corners").value,
+            quality_level    = self.get_parameter("quality_level").value,
+            min_distance     = self.get_parameter("min_distance").value,
+            win_size         = (win_w, win_h),
+            max_level        = self.get_parameter("max_level").value,
+            max_epipolar_err = self.get_parameter("max_epipolar_err").value,
+        )
 
         # Feature tracking state
         self._prev_left_features = None
@@ -348,10 +367,23 @@ class PoseEstimationNode(Node):
             )
             return None
 
-        self.get_logger().info(
+        self.get_logger().debug(
             f"ts={ts_ns} | PnP inliers={n_in}/{len(pts3d_v)} ({inlier_ratio:.0%}) "
             f"t={translation:.3f}m rot={angle_deg:.1f}°"
         )
+
+        # Throttled quality warnings — fire at most once per 3 s to avoid spam.
+        # Trigger when values are within 30% of their rejection thresholds.
+        if inlier_ratio < self.min_inlier_ratio * 1.3:
+            self.get_logger().warn(
+                f"Low inlier ratio {inlier_ratio:.0%} (threshold {self.min_inlier_ratio:.0%})",
+                throttle_duration_sec=3.0,
+            )
+        if translation > self.max_translation * 0.7:
+            self.get_logger().warn(
+                f"Large per-frame translation {translation:.3f} m (limit {self.max_translation} m)",
+                throttle_duration_sec=3.0,
+            )
 
         T = np.eye(4)
         T[:3, :3] = R
@@ -403,7 +435,7 @@ class PoseEstimationNode(Node):
         rpy_msg.vector.z = yaw
         self.rpy_pub.publish(rpy_msg)
 
-        self.get_logger().info(f"ts={ts_ns} | pos=({t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f})")
+        self.get_logger().debug(f"ts={ts_ns} | pos=({t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f})")
 
 
 def main(args=None):

@@ -26,7 +26,9 @@ Parameters
 import csv
 import math
 import os
+import shutil
 import signal
+import yaml
 from collections import deque
 
 import numpy as np
@@ -77,8 +79,16 @@ class DebugLoggerNode(Node):
             os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "tmp")
         )
         self.declare_parameter("output_dir", _default_out)
+        self.declare_parameter("pipeline_params_file", "")
         out_dir = self.get_parameter("output_dir").value
         os.makedirs(out_dir, exist_ok=True)
+
+        # Copy pipeline_params.yaml into the output dir so each run is self-contained
+        # and log all active parameters with color highlighting
+        params_src = self.get_parameter("pipeline_params_file").value
+        if params_src and os.path.isfile(params_src):
+            shutil.copy2(params_src, os.path.join(out_dir, "pipeline_params.yaml"))
+            self._log_pipeline_params(params_src)
 
         # ── Open CSV files ───────────────────────────────────────────────────
         self._fds:     dict = {}   # filename → file object
@@ -141,6 +151,60 @@ class DebugLoggerNode(Node):
         self.get_logger().info(
             f"DebugLoggerNode active — writing CSVs to '{out_dir}'"
         )
+
+    # ── Parameter reporting ────────────────────────────────────────────────────
+
+    # ANSI colour codes (work in most terminals / ros2 launch output)
+    _C = {
+        "reset":   "\033[0m",
+        "bold":    "\033[1m",
+        "header":  "\033[1;36m",   # bold cyan  — section headers
+        "key":     "\033[33m",     # yellow     — parameter names
+        "val":     "\033[32m",     # green      — parameter values
+        "dim":     "\033[2m",      # dim        — separator lines
+    }
+
+    def _log_pipeline_params(self, params_path: str) -> None:
+        """Read pipeline_params.yaml and log every value with colour."""
+        try:
+            with open(params_path) as f:
+                pp = yaml.safe_load(f)
+        except Exception as e:
+            self.get_logger().warn(f"Could not read pipeline params for logging: {e}")
+            return
+
+        C = self._C
+        sep  = f"{C['dim']}{'─' * 54}{C['reset']}"
+        lines = [
+            "",
+            f"{C['header']}{'═' * 54}{C['reset']}",
+            f"{C['header']}  Active Pipeline Parameters{C['reset']}",
+            f"{C['header']}{'═' * 54}{C['reset']}",
+        ]
+
+        section_colors = {
+            "eskf":             ("\033[1;34m", "ESKF"),            # bold blue
+            "imu":              ("\033[1;35m", "IMU preprocessing"),# bold magenta
+            "feature_tracking": ("\033[1;33m", "Feature Tracking"), # bold yellow
+            "vio":              ("\033[1;32m", "VIO Pose Estimation"),# bold green
+        }
+
+        for section_key, (color, label) in section_colors.items():
+            section = pp.get(section_key, {})
+            if not section:
+                continue
+            lines.append(sep)
+            lines.append(f"{color}  [{label}]{C['reset']}")
+            for k, v in section.items():
+                lines.append(
+                    f"    {C['key']}{k:<26}{C['reset']}"
+                    f"{C['val']}{v}{C['reset']}"
+                )
+
+        lines.append(f"{C['dim']}{'═' * 54}{C['reset']}")
+        lines.append("")
+
+        self.get_logger().info("\n".join(lines))
 
     # ── Signal handler ─────────────────────────────────────────────────────────
 

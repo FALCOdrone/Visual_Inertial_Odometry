@@ -11,6 +11,9 @@ Works with both EuRoC and UZH bags — pass the matching config file:
     ros2 bag play bags/uzh_indoor_9 --rate 0.5 --clock
     ros2 launch vio_pipeline full_pipeline.launch.py \\
         config_file:=/path/to/uzh_indoor_params.yaml
+
+Tunable parameters (ESKF noise, IMU filter cutoffs, KLT settings, VIO thresholds)
+live in config/pipeline_params.yaml — edit that file to change behaviour.
 """
 
 import os
@@ -28,11 +31,12 @@ from ament_index_python.packages import get_package_share_directory
 
 
 def _make_nodes(context, *args, **kwargs):
-    config_file  = LaunchConfiguration("config_file").perform(context)
-    use_sim_time = LaunchConfiguration("use_sim_time").perform(context)
-    use_tf       = LaunchConfiguration("use_tf_publisher").perform(context)
-    use_gps      = LaunchConfiguration("use_gps").perform(context)
-    gps_mode     = LaunchConfiguration("gps_mode").perform(context).lower()
+    config_file          = LaunchConfiguration("config_file").perform(context)
+    pipeline_params_file = LaunchConfiguration("pipeline_params_file").perform(context)
+    use_sim_time  = LaunchConfiguration("use_sim_time").perform(context)
+    use_tf        = LaunchConfiguration("use_tf_publisher").perform(context)
+    use_gps       = LaunchConfiguration("use_gps").perform(context)
+    gps_mode      = LaunchConfiguration("gps_mode").perform(context).lower()
     use_rectifier = LaunchConfiguration("use_rectifier").perform(context)
     use_sim_time_bool  = use_sim_time.lower()  in ("true", "1", "yes")
     use_tf_bool        = use_tf.lower()        in ("true", "1", "yes")
@@ -57,6 +61,14 @@ def _make_nodes(context, *args, **kwargs):
 
     imu_rate_hz = int(cfg.get("imu", {}).get("rate_hz", 200))
 
+    # Load tunable pipeline parameters from pipeline_params.yaml
+    with open(pipeline_params_file, "r") as f:
+        pp = yaml.safe_load(f)
+    eskf_p = pp["eskf"]
+    imu_p  = pp["imu"]
+    ft_p   = pp["feature_tracking"]
+    vio_p  = pp["vio"]
+
     output_dir = os.path.normpath(
         os.path.join(
             os.path.dirname(__file__), "..", "..", "..", "..", "..", "..", "tmp"
@@ -74,6 +86,21 @@ def _make_nodes(context, *args, **kwargs):
                 {
                     "config_path": config_file,
                     "use_sim_time": use_sim_time_bool,
+                    # Feature tracking params (passed to FeatureExtractor)
+                    "max_corners":       int(ft_p["max_corners"]),
+                    "quality_level":     float(ft_p["quality_level"]),
+                    "min_distance":      int(ft_p["min_distance"]),
+                    "win_size_w":        int(ft_p["win_size"][0]),
+                    "win_size_h":        int(ft_p["win_size"][1]),
+                    "max_level":         int(ft_p["max_level"]),
+                    "max_epipolar_err":  float(ft_p["max_epipolar_err"]),
+                    # VIO pose estimation params
+                    "min_tracks":               int(vio_p["min_tracks"]),
+                    "circular_check_threshold": float(vio_p["circular_check_threshold"]),
+                    "max_depth":                float(vio_p["max_depth"]),
+                    "min_inlier_ratio":         float(vio_p["min_inlier_ratio"]),
+                    "max_translation":          float(vio_p["max_translation"]),
+                    "max_rotation_deg":         float(vio_p["max_rotation_deg"]),
                 }
             ],
         ),
@@ -87,11 +114,11 @@ def _make_nodes(context, *args, **kwargs):
                 {
                     "config_path": config_file,
                     "use_sim_time": use_sim_time_bool,
-                    "imu_topic": "/imu0",
-                    "init_duration": .0,
-                    "gyro_lpf_cutoff": 15.0,
-                    "accel_lpf_cutoff": 10.0,
-                    "imu_rate_hz": imu_rate_hz,
+                    "imu_topic":        "/imu0",
+                    "init_duration":    float(imu_p["init_duration"]),
+                    "gyro_lpf_cutoff":  float(imu_p["gyro_lpf_cutoff"]),
+                    "accel_lpf_cutoff": float(imu_p["accel_lpf_cutoff"]),
+                    "imu_rate_hz":      imu_rate_hz,
                 }
             ],
         ),
@@ -124,27 +151,6 @@ def _make_nodes(context, *args, **kwargs):
         # These seed the filter's uncertainty at t=0.  They only affect the
         # first few VIO updates; after ~5 updates the filter self-calibrates.
         #
-        # init_pos_std  [m]    Initial position uncertainty.
-        #   Larger → first VIO update pulls position correction strongly.
-        #   Set ≥ expected VO displacement on the first frame.
-        #
-        # init_vel_std  [m/s]  Initial velocity uncertainty.
-        #   Larger → filter allows large initial velocity estimates.
-        #   Drone starts stationary → 0.1–0.5 m/s is generous but safe.
-        #
-        # init_att_std  [rad]  Initial attitude uncertainty.
-        #   Larger → first VIO rotation update has stronger influence.
-        #   Keep ≥ gravity-alignment error from static init (≈ 0.02–0.1 rad).
-        #
-        # init_ba_std   [m/s²] Initial accel-bias uncertainty.
-        #   Larger → filter learns bias faster but noisier velocity on startup.
-        #   Should bracket expected residual bias after imu_processing removes
-        #   the static mean (EuRoC residual ≈ 0.005–0.02 m/s²).
-        #
-        # init_bg_std   [rad/s] Initial gyro-bias uncertainty.
-        #   Larger → filter learns gyro drift faster at the cost of early noise.
-        #   EuRoC residual gyro bias ≈ 1e-4–5e-4 rad/s after static removal.
-        #
         # ── Numerical guard ───────────────────────────────────────────────────
         # max_dt  [s]  Discard IMU samples whose dt exceeds this threshold.
         #   Prevents covariance blow-up after bag gaps or node restarts.
@@ -158,26 +164,17 @@ def _make_nodes(context, *args, **kwargs):
                 {
                     "config_path": config_file,
                     "use_sim_time": use_sim_time_bool,
-                    # Measurement noise
-                    # meas_pos_std: how much to trust each VIO position measurement.
-                    #   EuRoC stereo VIO position accuracy ≈ 2–5 cm RMS → 0.05 m.
-                    #   With standalone GPS at 1.5 m std, filter trusts VIO 30× more.
-                    #   Increase (e.g. 0.15 m) if VIO is noisy or trajectory is long.
-                    "meas_pos_std": 0.1,  # m    — stereo VIO ≈ 2–5 cm RMS on EuRoC
-                    # meas_ang_std: how much to trust each VIO rotation measurement.
-                    #   Stereo VIO rotation accuracy ≈ 0.5–2° RMS → ~0.03 rad (1.7°).
-                    #   0.2 rad (11.5°) was far too pessimistic; gyro dominates unfairly.
-                    "meas_ang_std": 0.2,  # rad  — stereo VIO ≈ 0.5–2° RMS on EuRoC
-                    # Initial covariance
-                    "init_pos_std": 1.0,    # m    — generous; corrected on first update
-                    "init_vel_std": 0.3,    # m/s  — drone starts stationary; tighter than before
-                    "init_att_std": 0.05,   # rad  — ~2.9°; gravity-align from static buffer
-                    "init_ba_std":  0.02,   # m/s² — residual after static bias removal
-                    "init_bg_std":  5e-4,   # rad/s — residual gyro drift
-                    # Numerical guard
-                    "max_dt": 0.1,          # s    — skip IMU steps > 100 ms
+                    # All ESKF params loaded from pipeline_params.yaml
+                    "meas_pos_std": float(eskf_p["meas_pos_std"]),
+                    "meas_ang_std": float(eskf_p["meas_ang_std"]),
+                    "init_pos_std": float(eskf_p["init_pos_std"]),
+                    "init_vel_std": float(eskf_p["init_vel_std"]),
+                    "init_att_std": float(eskf_p["init_att_std"]),
+                    "init_ba_std":  float(eskf_p["init_ba_std"]),
+                    "init_bg_std":  float(eskf_p["init_bg_std"]),
+                    "max_dt":       float(eskf_p["max_dt"]),
                     # GPS fusion — profile set by gps_mode launch argument
-                    "use_gps":       True,
+                    "use_gps":       False,
                     "gps_pos_std_h": gps_eskf["pos_std_h"],
                     "gps_pos_std_v": gps_eskf["pos_std_v"],
                     "gps_gate_chi2": gps_eskf["gate_chi2"],
@@ -248,6 +245,8 @@ def _make_nodes(context, *args, **kwargs):
                 {
                     "use_sim_time": use_sim_time_bool,
                     "output_dir": output_dir,
+                    # Path to pipeline_params.yaml so the logger can copy it to tmp/
+                    "pipeline_params_file": pipeline_params_file,
                 }
             ],
         ),
@@ -267,6 +266,7 @@ def _make_nodes(context, *args, **kwargs):
 def generate_launch_description():
     pkg_share = get_package_share_directory("vio_pipeline")
     default_config = os.path.join(pkg_share, "config", "euroc_params.yaml")
+    default_pipeline_params = os.path.join(pkg_share, "config", "pipeline_params.yaml")
 
     return LaunchDescription(
         [
@@ -274,6 +274,11 @@ def generate_launch_description():
                 "config_file",
                 default_value=default_config,
                 description="Path to dataset params yaml (euroc_params.yaml or uzh_indoor_params.yaml)",
+            ),
+            DeclareLaunchArgument(
+                "pipeline_params_file",
+                default_value=default_pipeline_params,
+                description="Path to tunable pipeline parameters yaml (ESKF noise, IMU cutoffs, KLT settings)",
             ),
             DeclareLaunchArgument(
                 "use_sim_time",

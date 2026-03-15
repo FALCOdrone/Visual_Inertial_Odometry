@@ -21,7 +21,7 @@ class FeatureExtractor:
 
     def __init__(
         self,
-        max_corners: int = 100,       # cap on corners detected per frame; higher → more tracks (prev 500)
+        max_corners: int = 200,       # cap on corners detected per frame; higher → more tracks (prev 100)
                                       #   and better PnP conditioning, but more CPU per frame 
         quality_level: float = 0.5,  # fraction of the strongest corner's score below which  (prev = 0.01)
                                       #   candidates are rejected; lower → more (weaker) corners,
