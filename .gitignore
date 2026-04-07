@@ -68,7 +68,4 @@ ehthumbs.db
 # Temp files
 tmp/
 logs/
-
-
-#you didn't see this
 .claude/
