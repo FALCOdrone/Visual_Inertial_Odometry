@@ -119,11 +119,18 @@ class SlidingWindowGraph:
         gravity: np.ndarray | None = None,
         lm_max_iter: int = 5,
         lm_lambda_init: float = 1e-3,
+        preint_min_rot_std: float = 0.02,
+        preint_min_vel_std: float = 0.05,
+        preint_min_pos_std: float = 0.01,
     ):
         self._window_size = window_size
         self._gravity = gravity if gravity is not None else np.array([0.0, 0.0, -9.81])
         self._lm_max_iter = lm_max_iter
         self._lm_lambda_init = lm_lambda_init
+        self._preint_min_var = np.array(
+            [preint_min_rot_std**2]*3 + [preint_min_vel_std**2]*3 + [preint_min_pos_std**2]*3,
+            dtype=np.float64,
+        )
 
         self._states: list[KeyframeState] = []
         self._imu_factors: list[ImuFactor] = []
@@ -245,11 +252,9 @@ class SlidingWindowGraph:
         # Build information matrix (block diagonal)
         # Preintegration covariance for rotation/velocity/position (9x9)
         cov_preint = preint.covariance.copy()
-        # Clamp minimum eigenvalues for numerical stability
-        eigvals = np.linalg.eigvalsh(cov_preint)
-        min_eig = max(np.min(eigvals), 1e-12)
-        if min_eig < 1e-12:
-            cov_preint += np.eye(9) * 1e-12
+        # Apply covariance floor to cap IMU information
+        for i in range(9):
+            cov_preint[i, i] = max(cov_preint[i, i], self._preint_min_var[i])
 
         omega = np.zeros((15, 15), dtype=np.float64)
         try:
@@ -265,10 +270,13 @@ class SlidingWindowGraph:
         Jj = np.zeros((15, 15), dtype=np.float64)
 
         # Rotation residual Jacobians
+        # r_R = log(dR_corr.T @ Ri.T @ Rj)
+        # d r_R / d theta_i = -J_r^{-1}(r_R) @ dR_corr.T  (Forster TRO 2017)
+        # d r_R / d theta_j = +J_r^{-1}(r_R)
         r_R = log_so3(dR_corr.T @ Ri.T @ Rj)
-        Jr_inv = inv_right_jacobian_so3(r_R)
-        Ji[0:3, 0:3] = -Jr_inv @ Rj.T @ Ri  # d r_R / d theta_i
-        Jj[0:3, 0:3] = Jr_inv                 # d r_R / d theta_j
+        Jr_inv_rR = inv_right_jacobian_so3(r_R)
+        Ji[0:3, 0:3] = -Jr_inv_rR @ dR_corr.T  # d r_R / d theta_i
+        Jj[0:3, 0:3] = Jr_inv_rR                # d r_R / d theta_j
 
         # Velocity residual Jacobians
         Ji[3:6, 0:3] = skew(Ri.T @ (sj.v - si.v - g * dt))  # d r_v / d theta_i
@@ -283,7 +291,7 @@ class SlidingWindowGraph:
 
         # Navigation-to-bias Jacobians (from preintegration correction terms)
         # d(r_R)/d(b_g_i): rotation correction depends on gyro bias
-        Ji[0:3, 12:15] = -Jr_inv @ Rj.T @ Ri @ dR_corr @ preint.d_R_d_bg
+        Ji[0:3, 12:15] = -Jr_inv_rR @ preint.d_R_d_bg
 
         # d(r_v)/d(b_a_i) and d(r_v)/d(b_g_i)
         Ji[3:6, 9:12]  = -preint.d_v_d_ba
@@ -302,7 +310,15 @@ class SlidingWindowGraph:
         return r, Ji, Jj, omega
 
     def _vo_residual_and_jacobians(self, fac: VoFactor):
-        """Compute 6-dim VO residual and Jacobians."""
+        """Compute 6-dim VO residual and Jacobians.
+
+        Convention: dp_meas is already in body-i frame (R_i.T * (p_j - p_i)).
+        The rotation residual is expressed in the measurement rotation frame
+        (dR_meas.T * R_i.T * R_j).
+        The position residual is expressed in body-i frame directly — NOT
+        additionally rotated by dR_meas.T — so that fac.info (a diagonal
+        covariance in body-i frame) applies without frame mixing.
+        """
         si = self._states[fac.i]
         sj = self._states[fac.j]
 
@@ -312,34 +328,96 @@ class SlidingWindowGraph:
         # Residuals
         r = np.zeros(6, dtype=np.float64)
         r[0:3] = log_so3(dR_meas.T @ si.R.T @ sj.R)
-        r[3:6] = dR_meas.T @ (si.R.T @ (sj.p - si.p) - dp_meas)
+        # Position residual in body-i frame: predicted - measured
+        r[3:6] = si.R.T @ (sj.p - si.p) - dp_meas
 
         # Jacobians
         Ji = np.zeros((6, 15), dtype=np.float64)
         Jj = np.zeros((6, 15), dtype=np.float64)
 
         r_R = log_so3(dR_meas.T @ si.R.T @ sj.R)
-        Jr_inv = inv_right_jacobian_so3(r_R)
+        Jr_inv_rR = inv_right_jacobian_so3(r_R)
 
-        # Rotation
-        Ji[0:3, 0:3] = -Jr_inv @ sj.R.T @ si.R
-        Jj[0:3, 0:3] = Jr_inv
+        # Rotation: d r_R / d theta_i = -J_r^{-1}(r_R) @ dR_meas.T
+        #           d r_R / d theta_j = +J_r^{-1}(r_R)
+        Ji[0:3, 0:3] = -Jr_inv_rR @ dR_meas.T
+        Jj[0:3, 0:3] = Jr_inv_rR
 
-        # Position
+        # Position (residual = R_i.T*(p_j - p_i) - dp_meas, no extra dR_meas.T)
         dp_body = si.R.T @ (sj.p - si.p)
-        Ji[3:6, 0:3] = dR_meas.T @ skew(dp_body)
-        Ji[3:6, 3:6] = -dR_meas.T @ si.R.T                      # d r_p / d p_i
-        Jj[3:6, 3:6] = dR_meas.T @ si.R.T                       # d r_p / d p_j
+        Ji[3:6, 0:3] = skew(dp_body)         # d(R_i.T*(p_j-p_i))/d theta_i
+        Ji[3:6, 3:6] = -si.R.T               # d r_p / d p_i
+        Jj[3:6, 3:6] = si.R.T                # d r_p / d p_j
 
         return r, Ji, Jj
 
     # ── LM Optimizer ─────────────────────────────────────────────────────────
 
-    def _compute_cost(self, states: list[KeyframeState]) -> float:
-        """Compute total cost at given state values."""
+    def _imu_residual_only(self, fac: ImuFactor):
+        """Compute IMU residual and information matrix without Jacobians."""
+        si = self._states[fac.i]
+        sj = self._states[fac.j]
+        preint = fac.preint
+        dt = preint.delta_t
+        g = self._gravity
+
+        dR_corr, dv_corr, dp_corr = preint.correct(si.b_a, si.b_g)
+
+        r = np.zeros(15, dtype=np.float64)
+        r[0:3] = log_so3(dR_corr.T @ si.R.T @ sj.R)
+        r[3:6] = si.R.T @ (sj.v - si.v - g * dt) - dv_corr
+        r[6:9] = si.R.T @ (sj.p - si.p - si.v * dt - 0.5 * g * dt * dt) - dp_corr
+        r[9:12] = sj.b_a - si.b_a
+        r[12:15] = sj.b_g - si.b_g
+
+        cov_preint = preint.covariance.copy()
+        for i in range(9):
+            cov_preint[i, i] = max(cov_preint[i, i], self._preint_min_var[i])
+
+        omega = np.zeros((15, 15), dtype=np.float64)
+        try:
+            omega[0:9, 0:9] = np.linalg.inv(cov_preint)
+        except np.linalg.LinAlgError:
+            omega[0:9, 0:9] = np.eye(9) * 1e6
+        omega[9:12, 9:12] = fac.info_ba
+        omega[12:15, 12:15] = fac.info_bg
+
+        return r, omega
+
+    def _vo_residual_only(self, fac: VoFactor):
+        """Compute VO residual without Jacobians (must match _vo_residual_and_jacobians)."""
+        si = self._states[fac.i]
+        sj = self._states[fac.j]
+
+        r = np.zeros(6, dtype=np.float64)
+        r[0:3] = log_so3(fac.dR.T @ si.R.T @ sj.R)
+        r[3:6] = si.R.T @ (sj.p - si.p) - fac.dp
+
+        return r, fac.info
+
+    def _compute_cost_fast(self, states: list[KeyframeState]) -> float:
+        """Compute total cost without building Jacobians or H/b matrices."""
         old_states = self._states
         self._states = states
-        _, _, cost = self._build_system()
+        cost = 0.0
+
+        for fac in self._imu_factors:
+            r, omega = self._imu_residual_only(fac)
+            cost += r @ omega @ r
+
+        for fac in self._vo_factors:
+            r, info = self._vo_residual_only(fac)
+            cost += r @ info @ r
+
+        if self._prior is not None:
+            p = self._prior
+            num_prior_nodes = len(p.node_indices)
+            dx_full = np.zeros(num_prior_nodes * 15, dtype=np.float64)
+            for k, (ni, xl) in enumerate(zip(p.node_indices, p.x_lins)):
+                dx_full[k*15:(k+1)*15] = xl.local(self._states[ni])
+            r = p.J @ dx_full + p.r0
+            cost += float(r @ r)
+
         self._states = old_states
         return cost
 
@@ -382,7 +460,7 @@ class SlidingWindowGraph:
             for k, s in enumerate(self._states):
                 trial_states.append(s.retract(delta[k*15:(k+1)*15]))
 
-            trial_cost = self._compute_cost(trial_states)
+            trial_cost = self._compute_cost_fast(trial_states)
 
             if trial_cost < cost:
                 self._states = trial_states
@@ -391,8 +469,7 @@ class SlidingWindowGraph:
                 lam = min(lam * 5.0, 1e6)
 
         # Return final cost
-        _, _, final_cost = self._build_system()
-        return final_cost
+        return self._compute_cost_fast(self._states)
 
     # ── Marginalization ──────────────────────────────────────────────────────
 

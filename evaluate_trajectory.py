@@ -2,11 +2,12 @@
 """
 evaluate_trajectory.py
 ======================
-Offline scoring of ESKF vs VIO vs Ground Truth trajectories.
+Offline scoring of VIO backend trajectories vs Ground Truth.
 
-Reads pose CSVs written by debug_logger_node and computes standard VIO/SLAM
-evaluation metrics:
+Auto-detects which backends are available (ESKF / FGO / both) and evaluates
+each one.  VIO (front-end odometry) is always included for reference.
 
+Metrics:
   ATE (Absolute Trajectory Error)  — global accuracy after Umeyama SE3 alignment
   RPE (Relative Pose Error)        — local drift over fixed path-length segments
 
@@ -18,6 +19,9 @@ Output saved to logs/<YYYY-MM-DD_HH-MM-SS>/:
 
 Usage (run from project root):
     python evaluate_trajectory.py [--input tmp/] [--logs logs/]
+    python evaluate_trajectory.py --input tmp/ --backend fgo
+    python evaluate_trajectory.py --input tmp/ --backend eskf
+    python evaluate_trajectory.py --input tmp/ --backend both
 """
 
 import argparse
@@ -117,10 +121,9 @@ def umeyama_align(src: np.ndarray, dst: np.ndarray):
     src_c  = src - mu_src
     dst_c  = dst - mu_dst
 
-    H = src_c.T @ dst_c / len(src)          # (3, 3) cross-covariance
+    H = src_c.T @ dst_c / len(src)
     U, _, Vt = np.linalg.svd(H)
 
-    # Enforce proper rotation (det = +1)
     D = np.diag([1.0, 1.0, np.linalg.det(Vt.T @ U.T)])
     R = Vt.T @ D @ U.T
     t = mu_dst - R @ mu_src
@@ -165,8 +168,8 @@ def apply_align(R: np.ndarray, t: np.ndarray,
     """Apply SE3 to positions and quaternions."""
     pos_aligned  = (R @ pos.T).T + t
 
-    q_R = rot_to_quat(R)                           # scalar alignment quaternion
-    q_R_batch = np.tile(q_R, (len(quat), 1))       # (N, 4)
+    q_R = rot_to_quat(R)
+    q_R_batch = np.tile(q_R, (len(quat), 1))
     quat_aligned = qmul_batch(q_R_batch, quat)
     norms = np.linalg.norm(quat_aligned, axis=1, keepdims=True)
     quat_aligned /= np.where(norms > 1e-9, norms, 1.0)
@@ -193,7 +196,6 @@ def compute_ate_rot(q_est_aligned: np.ndarray, q_gt: np.ndarray) -> dict:
     Rotation ATE (degrees) after alignment.
     Uses geodesic angle:  θ = 2 · arccos(|w of q_gt⁻¹ * q_est|)
     """
-    # q_gt_inv: conjugate of unit quaternion = [-x,-y,-z,w]
     q_gt_inv = q_gt * np.array([-1, -1, -1, 1], dtype=np.float64)
     q_rel    = qmul_batch(q_gt_inv, q_est_aligned)
     norms    = np.linalg.norm(q_rel, axis=1, keepdims=True)
@@ -213,13 +215,6 @@ def compute_rpe(p_est: np.ndarray, p_gt: np.ndarray,
                 segment_lengths_m=(0.5, 1.0, 2.0, 5.0)) -> dict:
     """
     Relative Pose Error (translation) over fixed path-length segments.
-
-    For each segment length d, finds pairs (i,j) where GT path-length ≈ d,
-    then measures the deviation of the estimated relative displacement from GT.
-
-    Returns
-    -------
-    dict: {segment_length_m: np.ndarray of translation errors [m]}
     """
     step_d = np.linalg.norm(np.diff(p_gt, axis=0), axis=1)
     cum_d  = np.concatenate([[0.0], np.cumsum(step_d)])
@@ -277,25 +272,40 @@ def format_block(label: str, ate_pos: dict, ate_rot: dict, rpe: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Style map ─────────────────────────────────────────────────────────────────
+
+# Keyed by estimator name (lowercase). VIO always red, ESKF blue, FGO green.
+_STYLE = {
+    "vio":  {"color": "#cc3333", "ls": ":",  "lw": 1.0, "marker": "s", "label": "VIO"},
+    "eskf": {"color": "#3366cc", "ls": "--", "lw": 1.0, "marker": "^", "label": "ESKF"},
+    "fgo":  {"color": "#22aa44", "ls": "-.", "lw": 1.0, "marker": "D", "label": "FGO"},
+}
+
+
 # ── Plots ─────────────────────────────────────────────────────────────────────
 
-def plot_trajectories(gt_pos, eskf_pos, vio_pos, out_path: Path):
+def plot_trajectories(gt_pos, estimators: list, out_path: Path):
+    """
+    estimators: list of (name, pos_aligned) tuples.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle("Trajectory Comparison  (ESKF and VIO after SE3 alignment to GT)",
-                 fontsize=12)
+    title_names = " and ".join(s["style"]["label"] for _, _, s in estimators)
+    fig.suptitle(f"Trajectory Comparison  ({title_names} after SE3 alignment to GT)",
+                 fontsize=11)
 
     views = [
         (0, 1, "X [m]", "Y [m]", "Top-down  XY"),
         (0, 2, "X [m]", "Z [m]", "Side view  XZ"),
     ]
     for ax, (xi, yi, xl, yl, title) in zip(axes, views):
-        ax.plot(gt_pos[:,xi],   gt_pos[:,yi],   "k-",  lw=1.4, label="GT",   alpha=0.9)
-        ax.plot(eskf_pos[:,xi], eskf_pos[:,yi], "b--", lw=1.0, label="ESKF", alpha=0.85)
-        ax.plot(vio_pos[:,xi],  vio_pos[:,yi],  "r:",  lw=1.0, label="VIO",  alpha=0.85)
-        # Start markers
-        ax.plot(gt_pos[0,xi],   gt_pos[0,yi],   "ko", ms=6)
-        ax.plot(eskf_pos[0,xi], eskf_pos[0,yi], "b^", ms=6)
-        ax.plot(vio_pos[0,xi],  vio_pos[0,yi],  "rs", ms=6)
+        ax.plot(gt_pos[:, xi], gt_pos[:, yi], "k-", lw=1.4, label="GT", alpha=0.9)
+        ax.plot(gt_pos[0, xi], gt_pos[0, yi], "ko", ms=6)
+        for name, pos_al, sty in estimators:
+            ax.plot(pos_al[:, xi], pos_al[:, yi],
+                    color=sty["color"], ls=sty["ls"], lw=sty["lw"],
+                    label=sty["label"], alpha=0.85)
+            ax.plot(pos_al[0, xi], pos_al[0, yi],
+                    color=sty["color"], marker=sty["marker"], ms=6)
         ax.set(xlabel=xl, ylabel=yl, title=title)
         ax.legend(fontsize=9)
         ax.set_aspect("equal")
@@ -306,26 +316,26 @@ def plot_trajectories(gt_pos, eskf_pos, vio_pos, out_path: Path):
     plt.close(fig)
 
 
-def plot_ate_over_time(ts_eskf, ate_eskf_s, ts_vio, ate_vio_s,
-                       ts_eskf_r, rot_eskf_s, ts_vio_r, rot_vio_s,
-                       out_path: Path):
+def plot_ate_over_time(estimators_pos: list, estimators_rot: list, out_path: Path):
+    """
+    estimators_pos: list of (ts, ate_samples, style) — position ATE
+    estimators_rot: list of (ts, rot_samples, style) — rotation ATE
+    """
     fig, (ax_t, ax_r) = plt.subplots(2, 1, figsize=(12, 7), sharex=False)
     fig.suptitle("Absolute Trajectory Error over Time", fontsize=12)
 
-    t_e = (ts_eskf - ts_eskf[0]) * 1e-9
-    t_v = (ts_vio  - ts_vio[0])  * 1e-9
-
-    ax_t.plot(t_e, ate_eskf_s * 100, "b-",  lw=0.7, label="ESKF", alpha=0.9)
-    ax_t.plot(t_v, ate_vio_s  * 100, "r--", lw=0.7, label="VIO",  alpha=0.85)
+    for ts, samples, sty in estimators_pos:
+        t = (ts - ts[0]) * 1e-9
+        ax_t.plot(t, samples * 100, color=sty["color"], ls=sty["ls"],
+                  lw=0.7, label=sty["label"], alpha=0.9)
     ax_t.set(ylabel="Position ATE [cm]")
     ax_t.legend(fontsize=9)
     ax_t.grid(True, alpha=0.35)
 
-    t_er = (ts_eskf_r - ts_eskf_r[0]) * 1e-9
-    t_vr = (ts_vio_r  - ts_vio_r[0])  * 1e-9
-
-    ax_r.plot(t_er, rot_eskf_s, "b-",  lw=0.7, label="ESKF", alpha=0.9)
-    ax_r.plot(t_vr, rot_vio_s,  "r--", lw=0.7, label="VIO",  alpha=0.85)
+    for ts, samples, sty in estimators_rot:
+        t = (ts - ts[0]) * 1e-9
+        ax_r.plot(t, samples, color=sty["color"], ls=sty["ls"],
+                  lw=0.7, label=sty["label"], alpha=0.9)
     ax_r.set(xlabel="Elapsed time [s]", ylabel="Rotation ATE [°]")
     ax_r.legend(fontsize=9)
     ax_r.grid(True, alpha=0.35)
@@ -335,20 +345,22 @@ def plot_ate_over_time(ts_eskf, ate_eskf_s, ts_vio, ate_vio_s,
     plt.close(fig)
 
 
-def plot_rpe_boxplot(rpe_eskf: dict, rpe_vio: dict, out_path: Path):
-    seg_lens = sorted(rpe_eskf.keys())
+def plot_rpe_boxplot(estimators_rpe: list, out_path: Path):
+    """
+    estimators_rpe: list of (name, rpe_dict, style)
+    """
+    seg_lens = sorted(next(r for _, r, _ in estimators_rpe).keys())
     n = len(seg_lens)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 5), sharey=False)
     if n == 1:
         axes = [axes]
     fig.suptitle("RPE — translation drift % per segment length", fontsize=12)
 
-    colours = {"ESKF": "#4477aa", "VIO": "#cc3333"}
     for ax, seg in zip(axes, seg_lens):
-        data = {
-            "ESKF": rpe_eskf[seg] / seg * 100,
-            "VIO":  rpe_vio[seg]  / seg * 100,
-        }
+        data   = {sty["label"]: rpe[seg] / seg * 100
+                  for _, rpe, sty in estimators_rpe}
+        colors = {sty["label"]: sty["color"]
+                  for _, _, sty in estimators_rpe}
         bp = ax.boxplot(
             list(data.values()),
             labels=list(data.keys()),
@@ -357,7 +369,7 @@ def plot_rpe_boxplot(rpe_eskf: dict, rpe_vio: dict, out_path: Path):
             flierprops=dict(marker=".", ms=3, alpha=0.5),
         )
         for patch, label in zip(bp["boxes"], data.keys()):
-            patch.set_facecolor(colours[label])
+            patch.set_facecolor(colors[label])
         ax.set_title(f"{seg:.1f} m segment")
         ax.set_ylabel("Drift [%]" if ax is axes[0] else "")
         ax.grid(True, axis="y", alpha=0.35)
@@ -367,16 +379,44 @@ def plot_rpe_boxplot(rpe_eskf: dict, rpe_vio: dict, out_path: Path):
     plt.close(fig)
 
 
+# ── Backend detection ──────────────────────────────────────────────────────────
+
+# Maps backend key → (csv filename, display label, style key)
+_BACKEND_DEFS = {
+    "eskf": ("pose_eskf.csv", "ESKF", "eskf"),
+    "fgo":  ("pose_fgo.csv",  "FGO",  "fgo"),
+}
+
+
+def detect_backends(input_dir: Path, requested: str) -> list[str]:
+    """Return list of backend keys to evaluate based on --backend flag and file presence."""
+    if requested == "auto":
+        found = [k for k, (fname, _, _) in _BACKEND_DEFS.items()
+                 if (input_dir / fname).exists()]
+        if not found:
+            print("ERROR: no pose_eskf.csv or pose_fgo.csv found in input dir.",
+                  file=sys.stderr)
+            sys.exit(1)
+        return found
+    elif requested == "both":
+        return ["eskf", "fgo"]
+    else:
+        return [requested]
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Evaluate ESKF / VIO trajectories against ground truth."
+        description="Evaluate ESKF / FGO / VIO trajectories against ground truth."
     )
-    ap.add_argument("--input", default="tmp",
+    ap.add_argument("--input",   default="tmp",
                     help="Directory containing pose_*.csv files (default: tmp/)")
-    ap.add_argument("--logs",  default="logs",
+    ap.add_argument("--logs",    default="logs",
                     help="Parent directory for output folders (default: logs/)")
+    ap.add_argument("--backend", default="auto",
+                    choices=["auto", "eskf", "fgo", "both"],
+                    help="Which backend to evaluate (default: auto-detect from files)")
     args = ap.parse_args()
 
     input_dir = Path(args.input)
@@ -384,88 +424,123 @@ def main():
     out_dir   = Path(args.logs) / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load ─────────────────────────────────────────────────────────────────
-    files = {
-        "gt":   input_dir / "pose_gt.csv",
-        "eskf": input_dir / "pose_eskf.csv",
-        "vio":  input_dir / "pose_vio.csv",
-    }
-    missing = [str(p) for p in files.values() if not p.exists()]
+    # ── Detect backends ───────────────────────────────────────────────────────
+    backend_keys = detect_backends(input_dir, args.backend)
+
+    # ── Load GT and VIO (always required) ────────────────────────────────────
+    required = {"gt": input_dir / "pose_gt.csv", "vio": input_dir / "pose_vio.csv"}
+    missing = [str(p) for p in required.values() if not p.exists()]
     if missing:
         print(f"ERROR: missing files: {missing}", file=sys.stderr)
         sys.exit(1)
 
     print("Loading trajectories...")
-    ts_gt,   pos_gt,   q_gt   = load_traj(files["gt"])
-    ts_eskf, pos_eskf, q_eskf = load_traj(files["eskf"])
-    ts_vio,  pos_vio,  q_vio  = load_traj(files["vio"])
+    ts_gt, pos_gt, q_gt = load_traj(required["gt"])
+    ts_vio, pos_vio, q_vio = load_traj(required["vio"])
 
-    for name, ts in [("GT", ts_gt), ("ESKF", ts_eskf), ("VIO", ts_vio)]:
-        if len(ts) == 0:
-            print(f"ERROR: {name} CSV is empty.", file=sys.stderr)
-            sys.exit(1)
+    if len(ts_gt) == 0 or len(ts_vio) == 0:
+        print("ERROR: GT or VIO CSV is empty.", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"  GT   : {len(ts_gt):6d} samples")
-    print(f"  ESKF : {len(ts_eskf):6d} samples")
+    # ── Load backends ─────────────────────────────────────────────────────────
+    backend_data = {}  # key -> (ts, pos, quat)
+    for key in backend_keys:
+        fname, label, _ = _BACKEND_DEFS[key]
+        p = input_dir / fname
+        if not p.exists():
+            print(f"WARNING: {fname} not found — skipping {label}.", file=sys.stderr)
+            continue
+        ts_b, pos_b, q_b = load_traj(p)
+        if len(ts_b) == 0:
+            print(f"WARNING: {fname} is empty — skipping {label}.", file=sys.stderr)
+            continue
+        backend_data[key] = (ts_b, pos_b, q_b)
+        print(f"  {label:5s}: {len(ts_b):6d} samples")
+
+    if not backend_data:
+        print("ERROR: no backend data loaded.", file=sys.stderr)
+        sys.exit(1)
+
     print(f"  VIO  : {len(ts_vio):6d} samples")
+    print(f"  GT   : {len(ts_gt):6d} samples")
 
-    # ── Trim to common time window ────────────────────────────────────────────
-    t0 = max(ts_gt[0],  ts_eskf[0],  ts_vio[0])
-    t1 = min(ts_gt[-1], ts_eskf[-1], ts_vio[-1])
+    # ── Common time window across all loaded trajectories ─────────────────────
+    all_ts = [ts_gt, ts_vio] + [ts for ts, _, _ in backend_data.values()]
+    t0 = max(ts[0]  for ts in all_ts)
+    t1 = min(ts[-1] for ts in all_ts)
     if t0 >= t1:
         print("ERROR: trajectories have no overlapping time window.", file=sys.stderr)
         sys.exit(1)
 
-    ts_gt,   pos_gt,   q_gt   = trim(ts_gt,   pos_gt,   q_gt,   t0, t1)
-    ts_eskf, pos_eskf, q_eskf = trim(ts_eskf, pos_eskf, q_eskf, t0, t1)
-    ts_vio,  pos_vio,  q_vio  = trim(ts_vio,  pos_vio,  q_vio,  t0, t1)
+    ts_gt,  pos_gt,  q_gt  = trim(ts_gt,  pos_gt,  q_gt,  t0, t1)
+    ts_vio, pos_vio, q_vio = trim(ts_vio, pos_vio, q_vio, t0, t1)
+    backend_data = {k: trim(ts, pos, q, t0, t1)
+                    for k, (ts, pos, q) in backend_data.items()}
 
     duration_s = (t1 - t0) * 1e-9
     total_dist = float(np.sum(np.linalg.norm(np.diff(pos_gt, axis=0), axis=1)))
     print(f"  Overlap: {duration_s:.1f} s,  GT path: {total_dist:.2f} m")
 
-    # ── Interpolate GT to estimator timestamps ────────────────────────────────
-    pos_gt_at_eskf = interp_pos(ts_gt, pos_gt, ts_eskf)
-    q_gt_at_eskf   = interp_quat_nn(ts_gt, q_gt, ts_eskf)
+    # ── Interpolate GT to each estimator's timestamps ─────────────────────────
+    def interp_gt(ts_est):
+        return (interp_pos(ts_gt, pos_gt, ts_est),
+                interp_quat_nn(ts_gt, q_gt, ts_est))
 
-    pos_gt_at_vio  = interp_pos(ts_gt, pos_gt, ts_vio)
-    q_gt_at_vio    = interp_quat_nn(ts_gt, q_gt, ts_vio)
-
-    # ── Umeyama SE3 alignment ─────────────────────────────────────────────────
-    print("Aligning trajectories (Umeyama SE3)...")
-    R_eskf, t_eskf = umeyama_align(pos_eskf, pos_gt_at_eskf)
-    R_vio,  t_vio  = umeyama_align(pos_vio,  pos_gt_at_vio)
-
-    pos_eskf_al, q_eskf_al = apply_align(R_eskf, t_eskf, pos_eskf, q_eskf)
-    pos_vio_al,  q_vio_al  = apply_align(R_vio,  t_vio,  pos_vio,  q_vio)
-
-    # ── ATE ───────────────────────────────────────────────────────────────────
-    print("Computing ATE...")
-    ate_pos_eskf = compute_ate_pos(pos_eskf_al, pos_gt_at_eskf)
-    ate_rot_eskf = compute_ate_rot(q_eskf_al,   q_gt_at_eskf)
-
-    ate_pos_vio  = compute_ate_pos(pos_vio_al,  pos_gt_at_vio)
-    ate_rot_vio  = compute_ate_rot(q_vio_al,    q_gt_at_vio)
-
-    # ── RPE ───────────────────────────────────────────────────────────────────
-    print("Computing RPE...")
+    # ── Align and compute metrics for each estimator ──────────────────────────
     seg_lens = [0.5, 1.0, 2.0, 5.0]
-    rpe_eskf = compute_rpe(pos_eskf_al, pos_gt_at_eskf, seg_lens)
-    rpe_vio  = compute_rpe(pos_vio_al,  pos_gt_at_vio,  seg_lens)
+
+    # VIO baseline
+    pos_gt_vio, q_gt_vio = interp_gt(ts_vio)
+    R_vio, t_vio = umeyama_align(pos_vio, pos_gt_vio)
+    pos_vio_al, q_vio_al = apply_align(R_vio, t_vio, pos_vio, q_vio)
+    ate_pos_vio = compute_ate_pos(pos_vio_al, pos_gt_vio)
+    ate_rot_vio = compute_ate_rot(q_vio_al, q_gt_vio)
+    rpe_vio     = compute_rpe(pos_vio_al, pos_gt_vio, seg_lens)
+
+    # Backends
+    results = {}  # key -> dict with aligned data + metrics
+    for key, (ts_b, pos_b, q_b) in backend_data.items():
+        _, label, sty_key = _BACKEND_DEFS[key]
+        pos_gt_b, q_gt_b = interp_gt(ts_b)
+        R_b, t_b = umeyama_align(pos_b, pos_gt_b)
+        pos_b_al, q_b_al = apply_align(R_b, t_b, pos_b, q_b)
+        results[key] = {
+            "label":    label,
+            "style":    _STYLE[sty_key],
+            "ts":       ts_b,
+            "pos_al":   pos_b_al,
+            "q_al":     q_b_al,
+            "pos_gt":   pos_gt_b,
+            "q_gt":     q_gt_b,
+            "ate_pos":  compute_ate_pos(pos_b_al, pos_gt_b),
+            "ate_rot":  compute_ate_rot(q_b_al, q_gt_b),
+            "rpe":      compute_rpe(pos_b_al, pos_gt_b, seg_lens),
+        }
 
     # ── Summary text ──────────────────────────────────────────────────────────
+    backend_labels = " + ".join(r["label"] for r in results.values())
+    run_type = backend_labels  # e.g. "ESKF", "FGO", "ESKF + FGO"
+
     header = (
         f"VIO Trajectory Evaluation Report\n"
         f"{'='*52}\n"
         f"  Generated  : {timestamp}\n"
         f"  Input dir  : {input_dir.resolve()}\n"
+        f"  Backend(s) : {run_type}\n"
         f"  GT samples : {len(ts_gt)}\n"
         f"  Duration   : {duration_s:.1f} s\n"
         f"  GT path    : {total_dist:.2f} m\n\n"
     )
-    eskf_block = format_block("ESKF vs Ground Truth", ate_pos_eskf, ate_rot_eskf, rpe_eskf)
-    vio_block  = format_block("VIO  vs Ground Truth", ate_pos_vio,  ate_rot_vio,  rpe_vio)
-    summary = header + eskf_block + "\n" + vio_block
+
+    blocks = []
+    for key, r in results.items():
+        blocks.append(format_block(
+            f"{r['label']} vs Ground Truth",
+            r["ate_pos"], r["ate_rot"], r["rpe"]
+        ))
+    blocks.append(format_block("VIO  vs Ground Truth",
+                                ate_pos_vio, ate_rot_vio, rpe_vio))
+    summary = header + "\n".join(blocks)
 
     summary_path = out_dir / "summary.txt"
     summary_path.write_text(summary)
@@ -475,29 +550,44 @@ def main():
     if _HAS_MPL:
         print("Saving plots...")
 
-        # Trajectory: downsample ESKF (200 Hz → ~20 Hz) to avoid over-plotting
-        step = max(1, len(ts_eskf) // max(len(ts_vio), 1))
-        plot_trajectories(
-            pos_gt,
-            pos_eskf_al[::step],
-            pos_vio_al,
-            out_dir / "trajectory.png",
-        )
+        vio_sty = _STYLE["vio"]
+
+        # Build estimator lists for plots
+        # For trajectory: downsample high-rate estimators to avoid over-plotting
+        traj_estimators = []
+        for key, r in results.items():
+            traj_estimators.append((key, r["pos_al"], r))
+        traj_estimators.append(("vio", pos_vio_al, {"style": vio_sty}))
+
+        plot_trajectories(pos_gt, traj_estimators, out_dir / "trajectory.png")
         print("  trajectory.png")
 
-        plot_ate_over_time(
-            ts_eskf[::step], ate_pos_eskf["samples"][::step],
-            ts_vio,          ate_pos_vio["samples"],
-            ts_eskf[::step], ate_rot_eskf["samples"][::step],
-            ts_vio,          ate_rot_vio["samples"],
-            out_dir / "ate_over_time.png",
-        )
+        # ATE over time
+        ate_pos_series = []
+        ate_rot_series = []
+        for key, r in results.items():
+            sty = r["style"]
+            ts = r["ts"]
+            # Downsample if much denser than VIO (e.g. ESKF at 200 Hz)
+            step = max(1, len(ts) // max(len(ts_vio), 1))
+            ate_pos_series.append((ts[::step], r["ate_pos"]["samples"][::step], sty))
+            ate_rot_series.append((ts[::step], r["ate_rot"]["samples"][::step], sty))
+        ate_pos_series.append((ts_vio, ate_pos_vio["samples"], vio_sty))
+        ate_rot_series.append((ts_vio, ate_rot_vio["samples"], vio_sty))
+
+        plot_ate_over_time(ate_pos_series, ate_rot_series, out_dir / "ate_over_time.png")
         print("  ate_over_time.png")
 
-        plot_rpe_boxplot(rpe_eskf, rpe_vio, out_dir / "rpe_boxplot.png")
+        # RPE boxplot
+        rpe_estimators = []
+        for key, r in results.items():
+            rpe_estimators.append((key, r["rpe"], r["style"]))
+        rpe_estimators.append(("vio", rpe_vio, vio_sty))
+
+        plot_rpe_boxplot(rpe_estimators, out_dir / "rpe_boxplot.png")
         print("  rpe_boxplot.png")
 
-    # ── Archive raw data into the log dir ────────────────────────────────────
+    # ── Archive raw data ──────────────────────────────────────────────────────
     print("Archiving raw data...")
     for csv_path in glob.glob(str(input_dir / "*.csv")):
         shutil.copy2(csv_path, out_dir)

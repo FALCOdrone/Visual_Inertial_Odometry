@@ -93,16 +93,22 @@ class ImuPreintegrator:
         self._covariance = (self._covariance + self._covariance.T) * 0.5
 
         # --- Bias Jacobians ---
+        # Cache old values before updating — downstream Jacobians require step-k
+        # values, not the updated step-(k+1) values (Forster TRO 2017).
+        d_R_d_bg_prev = self._d_R_d_bg.copy()
+        d_v_d_ba_prev = self._d_v_d_ba.copy()
+        d_v_d_bg_prev = self._d_v_d_bg.copy()
+
         # d_R_d_bg: propagation
-        self._d_R_d_bg = dR_inc.T @ self._d_R_d_bg - Jr * dt
+        self._d_R_d_bg = dR_inc.T @ d_R_d_bg_prev - Jr * dt
 
-        # d_v_d_ba, d_v_d_bg
-        self._d_v_d_ba = self._d_v_d_ba + (-self._delta_R) * dt  # -dR @ I * dt
-        self._d_v_d_bg = self._d_v_d_bg + (-self._delta_R @ skew(f_corr) @ self._d_R_d_bg) * dt
+        # d_v_d_ba, d_v_d_bg (use old d_R_d_bg)
+        self._d_v_d_ba = d_v_d_ba_prev + (-self._delta_R) * dt  # -dR @ I * dt
+        self._d_v_d_bg = d_v_d_bg_prev + (-self._delta_R @ skew(f_corr) @ d_R_d_bg_prev) * dt
 
-        # d_p_d_ba, d_p_d_bg
-        self._d_p_d_ba = self._d_p_d_ba + self._d_v_d_ba * dt + 0.5 * (-self._delta_R) * dt * dt
-        self._d_p_d_bg = self._d_p_d_bg + self._d_v_d_bg * dt + 0.5 * (-self._delta_R @ skew(f_corr) @ self._d_R_d_bg) * dt * dt
+        # d_p_d_ba, d_p_d_bg (use old d_v_d_ba, d_v_d_bg, d_R_d_bg)
+        self._d_p_d_ba = self._d_p_d_ba + d_v_d_ba_prev * dt + 0.5 * (-self._delta_R) * dt * dt
+        self._d_p_d_bg = self._d_p_d_bg + d_v_d_bg_prev * dt + 0.5 * (-self._delta_R @ skew(f_corr) @ d_R_d_bg_prev) * dt * dt
 
         # --- State propagation ---
         # Order matters: use current delta_R before updating it

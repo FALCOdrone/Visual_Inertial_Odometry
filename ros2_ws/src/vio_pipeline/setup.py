@@ -33,6 +33,7 @@ setup(
             "gps_simulator_node = vio_pipeline.gps_simulator_node:main",
             "stereo_rectifier_node = vio_pipeline.stereo_rectifier_node:main",
             "fgo_backend_node = vio_pipeline.fgo_backend_node:main",
+            "loop_closure_node = vio_pipeline.loop_closure_node:main",
         ],
     },
 )

@@ -77,15 +77,15 @@ class PoseEstimationNode(Node):
         self.declare_parameter("max_corners", 200)
         self.declare_parameter("quality_level", 0.5)
         self.declare_parameter("min_distance", 20)
-        self.declare_parameter("win_size_w", 14)
-        self.declare_parameter("win_size_h", 14)
+        self.declare_parameter("win_size_w", 21)
+        self.declare_parameter("win_size_h", 21)
         self.declare_parameter("max_level", 3)
         self.declare_parameter("max_epipolar_err", 2.0)
-        self.declare_parameter("kf_min_translation",  0.05)
-        self.declare_parameter("kf_min_rotation_deg", 3.0)
-        self.declare_parameter("kf_max_frames",       10)
-        self.declare_parameter("pose_cov_pos_base",   0.05)
-        self.declare_parameter("pose_cov_ang_base",   0.05)
+        self.declare_parameter("kf_min_translation",  0.03)
+        self.declare_parameter("kf_min_rotation_deg", 2.0)
+        self.declare_parameter("kf_max_frames",       5)
+        self.declare_parameter("pose_cov_pos_base",   0.03)
+        self.declare_parameter("pose_cov_ang_base",   0.03)
 
         config_path = self.get_parameter("config_path").value
         self.min_tracks = self.get_parameter("min_tracks").value
@@ -307,15 +307,6 @@ class PoseEstimationNode(Node):
                 self.get_logger().debug(
                     f"ts={ts_ns} | skip KF (t={trans:.3f}m r={angle_deg:.1f}° f={self._frames_since_kf})"
                 )
-
-    def _undistort_points(self, pts, K, dist):
-        """Undistort 2D keypoints back into ideal pixel coordinates."""
-        if pts.shape[0] == 0:
-            return pts
-        undist = cv2.undistortPoints(
-            pts.reshape(-1, 1, 2).astype(np.float64), K, dist, P=K
-        )
-        return undist.reshape(-1, 2)
 
     def _triangulate(self, kpts_l, kpts_r):
         """Triangulate stereo correspondences. Returns (N, 3) points in cam0 frame."""

@@ -22,14 +22,14 @@ eskf:
 
 # ── IMU preprocessing ─────────────────────────────────────────────────────────
 imu:
-  init_duration:     0.0   # s   — static window for bias/gravity initialisation
+  init_duration:     4.0   # s   — static window for bias/gravity initialisation
   gyro_lpf_cutoff:  15.0   # Hz  — Butterworth LPF cutoff for gyroscope
   accel_lpf_cutoff: 10.0   # Hz  — Butterworth LPF cutoff for accelerometer
 
 # ── KLT feature tracker ───────────────────────────────────────────────────────
 feature_tracking:
   max_corners:      100    # cap on Shi-Tomasi corners per frame
-  quality_level:    0.5    # fraction of strongest corner score; higher → fewer but stronger
+  quality_level:    0.03   # fraction of strongest corner score; 0.5 was too aggressive (only 20-40 features)
   min_distance:     20     # minimum pixel gap between corners
   win_size:         [21, 21]  # KLT patch size [w, h] at each pyramid level
   max_level:        3      # pyramid depth (0 = no pyramid)
@@ -46,20 +46,53 @@ vio:
   kf_min_translation: 0.03   # m   — min accumulated translation from last KF to publish
   kf_min_rotation_deg: 2.0   # deg — min accumulated rotation from last KF to publish
   kf_max_frames: 5            # failsafe: publish at least every N frames (5 = 0.25 s at 20 Hz)
-  pose_cov_pos_base: 0.03    # m   — base 1-σ; at inlier_ratio=1.0 matches static meas_pos_std
-  pose_cov_ang_base: 0.03    # rad — base 1-σ; at inlier_ratio=1.0 matches static meas_ang_std
+  pose_cov_pos_base: 0.03    # m   — per-step VIO position noise (~1-2 cm per keyframe)
+  pose_cov_ang_base: 0.05    # rad — per-step VIO rotation noise (~0.5-2° per keyframe)
 
 # ── Factor Graph Optimization (FGO) backend ────────────────────────────────
 fgo:
-  window_size:     10       # keyframes in sliding window
-  lm_max_iter:     8        # LM iterations per keyframe arrival
+  window_size:     10       # keyframes in sliding window (larger = more VO corrections per optimization)
+  lm_max_iter:     10       # LM iterations per keyframe arrival
   lm_lambda_init:  1.0e-3   # initial LM damping
-  imu_noise_scale: 20.0     # inflate IMU white noise for preintegration (standard for FGO)
+  imu_noise_scale: 1.0      # datasheet values; preint_min_* floors control IMU/VO balance
   min_gravity_samples: 100  # wait for N raw IMU samples before init (gravity estimation)
-  vo_pos_std:      0.05     # m   — fallback if VIO covariance is zero
-  vo_ang_std:      0.05     # rad — fallback if VIO covariance is zero
+  vo_pos_std:      0.05     # m   — fallback VO position noise (if VIO covariance is zero)
+  vo_ang_std:      0.05     # rad — fallback VO rotation noise (~2.9°)
   prior_pos_std:   0.01     # m   — prior on first keyframe position
   prior_vel_std:   1.0      # m/s — prior on first keyframe velocity
   prior_att_std:   0.01     # rad — prior on first keyframe attitude
   prior_ba_std:    0.02     # m/s² — prior on accel bias
   prior_bg_std:    5.0e-4   # rad/s — prior on gyro bias
+  # IMU/VO balance: IMU rotation info = 1/0.02² = 2500, VO rotation info = 1/0.05² = 400
+  # → IMU ~6x more informative than VO for rotation (IMU corrects drift but VO can still pull back)
+  # → If vo_ang_std dynamic cov at inlier=0.6: 1/(0.05/0.6)² ≈ 144 → IMU 17x dominant, still correctable
+  preint_min_rot_std: 0.02  # rad — IMU rotation floor (~6x more informative than vo_ang_std=0.05)
+  preint_min_vel_std: 0.05  # m/s — IMU velocity floor
+  preint_min_pos_std: 0.02  # m   — IMU position floor
+
+# ── Loop closure (use_loop_closure:=true to enable) ─────────────────────────
+loop_closure:
+  # BoW candidate filtering
+  min_keyframe_separation: 20    # min KF gap to avoid matching recent frames
+  min_loop_score:          0.015 # TF-IDF cosine similarity threshold
+  min_lc_inliers:          20    # Essential-matrix RANSAC inlier count required
+  max_lc_correction_m:     5.0   # reject loops that require > N m correction
+
+  # Pose graph noise (used as information matrix weights)
+  lc_pos_std:  0.3    # m   — LC position noise (looser than odometry)
+  lc_ang_std:  0.05   # rad — LC angular noise
+
+  # BoW vocabulary
+  vocab_size:          256  # k-means cluster centers (visual words)
+  vocab_min_keyframes:  20  # wait for N keyframes before building vocabulary
+
+  # ORB extraction
+  orb_n_features: 500   # ORB features per keyframe
+
+  # Pose graph optimizer
+  pgo_max_iter: 5       # Gauss-Newton iterations (3-5 sufficient for sparse graphs)
+
+  # Keyframe selection within the LC node (independent of VIO keyframer)
+  kf_translation_thresh:   0.05  # m   — min translation from last LC keyframe
+  kf_rotation_thresh_deg:  3.0   # deg — min rotation from last LC keyframe
+  kf_max_age_sec:          0.5   # s   — max time between LC keyframes

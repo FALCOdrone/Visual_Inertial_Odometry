@@ -241,8 +241,8 @@ class ImuProcessingNode(Node):
         self.declare_parameter("config_path", "")
         self.declare_parameter("imu_topic", "/imu0")
         self.declare_parameter("init_duration", 2.0)
-        self.declare_parameter("gyro_lpf_cutoff", 50.0)
-        self.declare_parameter("accel_lpf_cutoff", 30.0)
+        self.declare_parameter("gyro_lpf_cutoff", 15.0)
+        self.declare_parameter("accel_lpf_cutoff", 10.0)
         self.declare_parameter("imu_rate_hz", 200)
         config_path = self.get_parameter("config_path").value
         imu_topic = self.get_parameter("imu_topic").value
@@ -465,20 +465,22 @@ class ImuProcessingNode(Node):
         Note: This integration will drift. It is intended as a preview for
         the upcoming ESKF, which will correct the drift with visual updates.
         """
-        # Quaternion integration
+        # True world-frame acceleration (gravity removal) — computed with
+        # current-step attitude *before* quaternion update to avoid using
+        # next-step orientation for current-step acceleration.
+        R_wb = _quat_to_rot(self._q)
+        a_world = R_wb @ accel + self._gravity  # gravity = [0, 0, -9.81]
+
+        self._pos += self._vel * dt + 0.5 * a_world * (dt * dt)
+        self._vel += a_world * dt
+
+        # Quaternion integration (after position/velocity update)
         dtheta = gyro * dt
         angle = np.linalg.norm(dtheta)
         if angle > 1e-10:
             dq = _axis_angle_to_quat(dtheta / angle, angle)
             self._q = _quat_mul(self._q, dq)
             self._q /= np.linalg.norm(self._q)  # numerical normalisation
-
-        # True world-frame acceleration (gravity removal)
-        R_wb = _quat_to_rot(self._q)
-        a_world = R_wb @ accel + self._gravity  # gravity = [0, 0, -9.81]
-
-        self._pos += self._vel * dt + 0.5 * a_world * (dt * dt)
-        self._vel += a_world * dt
 
     # ── Publishers ────────────────────────────────────────────────────────────
 

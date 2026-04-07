@@ -38,8 +38,8 @@ class FgoBackendNode(Node):
 
         # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter("config_path", "")
-        self.declare_parameter("window_size", 10)
-        self.declare_parameter("lm_max_iter", 5)
+        self.declare_parameter("window_size", 7)
+        self.declare_parameter("lm_max_iter", 3)
         self.declare_parameter("lm_lambda_init", 1e-3)
         self.declare_parameter("vo_pos_std", 0.05)
         self.declare_parameter("vo_ang_std", 0.05)
@@ -48,8 +48,11 @@ class FgoBackendNode(Node):
         self.declare_parameter("prior_att_std", 0.01)
         self.declare_parameter("prior_ba_std", 0.02)
         self.declare_parameter("prior_bg_std", 5.0e-4)
-        self.declare_parameter("imu_noise_scale", 20.0)
+        self.declare_parameter("imu_noise_scale", 1.0)
         self.declare_parameter("min_gravity_samples", 100)
+        self.declare_parameter("preint_min_rot_std", 0.02)
+        self.declare_parameter("preint_min_vel_std", 0.05)
+        self.declare_parameter("preint_min_pos_std", 0.01)
 
         config_path = self.get_parameter("config_path").value
         self._window_size = int(self.get_parameter("window_size").value)
@@ -64,6 +67,9 @@ class FgoBackendNode(Node):
         self._prior_bg_std = float(self.get_parameter("prior_bg_std").value)
         self._imu_noise_scale = float(self.get_parameter("imu_noise_scale").value)
         self._min_gravity_samples = int(self.get_parameter("min_gravity_samples").value)
+        self._preint_min_rot_std = float(self.get_parameter("preint_min_rot_std").value)
+        self._preint_min_vel_std = float(self.get_parameter("preint_min_vel_std").value)
+        self._preint_min_pos_std = float(self.get_parameter("preint_min_pos_std").value)
 
         # ── IMU noise figures ─────────────────────────────────────────────────
         self._gravity = np.array([0.0, 0.0, -9.81], dtype=np.float64)
@@ -90,9 +96,11 @@ class FgoBackendNode(Node):
                     f"Could not load config '{config_path}': {exc}. Using defaults."
                 )
 
-        # Scale IMU white noise for preintegration (standard practice for
-        # optimization-based VIO — datasheet values are too tight, causing
-        # IMU factors to dominate over VO factors; VINS-Mono uses ~20-40x)
+        # Scale IMU white noise for preintegration.
+        # Default is 1.0 (use datasheet values directly). The preint_min_*_std
+        # parameters in the graph act as covariance floors that cap maximum IMU
+        # information and balance it against VO factors — imu_noise_scale > 1
+        # is only needed when the floors alone are insufficient.
         self._sigma_a = self._sigma_a_raw * self._imu_noise_scale
         self._sigma_g = self._sigma_g_raw * self._imu_noise_scale
 
@@ -142,7 +150,9 @@ class FgoBackendNode(Node):
         self._path_msg.header.frame_id = "map"
 
         # ── Subscribers ───────────────────────────────────────────────────────
-        self.create_subscription(Imu, "/imu0", self._raw_imu_cb, qos_be)
+        self.declare_parameter("raw_imu_topic", "/imu0")
+        raw_imu_topic = self.get_parameter("raw_imu_topic").value
+        self.create_subscription(Imu, raw_imu_topic, self._raw_imu_cb, qos_be)
         self.create_subscription(Imu, "/imu/processed", self._imu_cb, qos_be)
         self.create_subscription(Odometry, "/vio/odometry", self._vio_cb, 10)
 
@@ -198,16 +208,20 @@ class FgoBackendNode(Node):
         q_meas /= np.linalg.norm(q_meas)
         R_meas = quat_to_rot(q_meas)
 
-        # Extract covariance from VIO message
+        # Extract covariance from VIO message.
+        # VO residual order in factor_graph.py is [rot(3), pos(3)], so cov_6x6
+        # must be ordered [ang(3), pos(3)] — NOT [pos, ang] as stored in the
+        # ROS Odometry pose.covariance (which is [x,y,z,rx,ry,rz]).
         cov_flat = msg.pose.covariance
         if any(c != 0.0 for c in cov_flat):
             pos_var = [cov_flat[0], cov_flat[7], cov_flat[14]]
             ang_var = [cov_flat[21], cov_flat[28], cov_flat[35]]
-            cov_6x6 = np.diag(pos_var + ang_var)
+            # ang first, then pos — matches [r_R(0:3), r_p(3:6)] residual ordering
+            cov_6x6 = np.diag(ang_var + pos_var)
         else:
             cov_6x6 = np.diag([
-                self._vo_pos_std**2, self._vo_pos_std**2, self._vo_pos_std**2,
                 self._vo_ang_std**2, self._vo_ang_std**2, self._vo_ang_std**2,
+                self._vo_pos_std**2, self._vo_pos_std**2, self._vo_pos_std**2,
             ])
 
         # ── First keyframe: initialize ────────────────────────────────────────
@@ -305,6 +319,9 @@ class FgoBackendNode(Node):
             gravity=self._gravity,
             lm_max_iter=self._lm_max_iter,
             lm_lambda_init=self._lm_lambda_init,
+            preint_min_rot_std=self._preint_min_rot_std,
+            preint_min_vel_std=self._preint_min_vel_std,
+            preint_min_pos_std=self._preint_min_pos_std,
         )
 
         # Initial state: zero velocity and biases

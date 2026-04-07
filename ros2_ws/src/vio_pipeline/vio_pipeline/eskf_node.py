@@ -380,7 +380,9 @@ class EskfNode(Node):
         self._path_msg.header.frame_id = "map"
 
         # ── Subscribers ──────────────────────────────────────────────────────
-        self.create_subscription(Imu, "/imu0", self._raw_imu_cb, qos_be)
+        self.declare_parameter("raw_imu_topic", "/imu0")
+        raw_imu_topic = self.get_parameter("raw_imu_topic").value
+        self.create_subscription(Imu, raw_imu_topic, self._raw_imu_cb, qos_be)
         self.create_subscription(Imu, "/imu/processed", self._imu_cb, qos_be)
         self.create_subscription(Odometry, "/vio/odometry", self._vio_cb, 10)
         if self._use_gps:
@@ -388,12 +390,29 @@ class EskfNode(Node):
                 PointStamped, "/gps/enu", self._gps_cb, qos_be
             )
 
+        # ── Loop closure correction subscriber ───────────────────────────────
+        # When loop_closure_node detects and closes a loop, it publishes a
+        # geometry_msgs/PoseStamped on /lc/correction encoding the SE(3)
+        # correction to apply:
+        #   position field → delta_p (additive position correction)
+        #   orientation field → delta_R as quaternion (multiplicative on left)
+        # Velocity and biases are preserved (LC corrects only accumulated drift).
+        self.declare_parameter("use_loop_closure", False)
+        self._use_lc = bool(self.get_parameter("use_loop_closure").value)
+        if self._use_lc:
+            self.create_subscription(
+                PoseStamped, "/lc/correction", self._lc_correction_cb, 10
+            )
+            self.get_logger().info("ESKF: loop closure correction subscriber ACTIVE (/lc/correction)")
+
         self._gps_update_count  = 0
         self._gps_reject_count  = 0
+        self._lc_correction_count = 0
 
         self.get_logger().info(
             "EskfNode ready — waiting for first VIO measurement to initialise. "
-            f"GPS fusion: {'ON' if self._use_gps else 'OFF'}"
+            f"GPS fusion: {'ON' if self._use_gps else 'OFF'}  "
+            f"Loop closure: {'ON' if self._use_lc else 'OFF'}"
         )
 
     # ── Raw IMU gravity buffer ──────────────────────────────────────────────────
@@ -584,6 +603,81 @@ class EskfNode(Node):
                 f"rejected={self._gps_reject_count}"
             )
 
+    # ── Loop closure correction ─────────────────────────────────────────────────
+
+    def _lc_correction_cb(self, msg: PoseStamped) -> None:
+        """
+        Apply a loop-closure SE(3) correction to the current nominal state.
+
+        The correction is encoded in a PoseStamped:
+          position    → delta_p  (additive position offset in world frame)
+          orientation → delta_R  as quaternion (applied on the LEFT of R_nom)
+
+        Velocity and biases carry over unchanged: loop closure corrects only the
+        accumulated positional and rotational drift, not the instantaneous dynamics.
+
+        The error-state covariance P is partially reset for the position and
+        attitude blocks to reflect the new uncertainty introduced by the LC update.
+        Using a gentle 2x inflation (rather than zeroing) so the filter does not
+        diverge from the IMU dynamics immediately after correction.
+        """
+        if self._state != self._RUNNING:
+            return
+
+        # Extract delta_p and delta_R from the message
+        dp = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+        ], dtype=np.float64)
+
+        q_corr = np.array([
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+            msg.pose.orientation.w,
+        ], dtype=np.float64)
+        q_norm = np.linalg.norm(q_corr)
+        if q_norm < 1e-8:
+            self.get_logger().warn("LC correction: near-zero quaternion received, skipping")
+            return
+        q_corr /= q_norm
+
+        # Sanity check: reject implausibly large corrections
+        dp_norm = np.linalg.norm(dp)
+        dR_mat = _quat_to_rot(q_corr)
+        dtheta = np.degrees(np.linalg.norm(_log_so3(dR_mat)))
+        if dp_norm > 20.0 or dtheta > 180.0:
+            self.get_logger().warn(
+                f"LC correction rejected: |dp|={dp_norm:.2f} m  dtheta={dtheta:.1f} deg "
+                f"(implausibly large)"
+            )
+            return
+
+        # Apply correction to nominal state
+        self._p += dp
+        self._q = _quat_mul(
+            np.array([q_corr[0], q_corr[1], q_corr[2], q_corr[3]]),
+            self._q,
+        )
+        self._q /= np.linalg.norm(self._q)
+
+        # Gently inflate position and attitude covariance blocks to reflect
+        # the new uncertainty introduced by the loop correction.  Factor 2 is
+        # conservative — the PGO result is typically accurate to ~0.1 m / ~0.5 deg.
+        lc_pos_var = 0.1 ** 2   # 10 cm 1-sigma post-LC uncertainty
+        lc_att_var = (0.02) ** 2  # ~1.1 deg 1-sigma
+        for i in range(3):
+            self._P[i, i]     = max(self._P[i, i],     lc_pos_var)
+            self._P[6+i, 6+i] = max(self._P[6+i, 6+i], lc_att_var)
+
+        self._lc_correction_count += 1
+        self.get_logger().info(
+            f"ESKF: loop closure correction #{self._lc_correction_count} applied: "
+            f"dp={np.round(dp, 3)} m  dtheta={dtheta:.2f} deg  "
+            f"new_p={np.round(self._p, 3)}"
+        )
+
     # ── Prediction step ────────────────────────────────────────────────────────
 
     def _predict(self, gyro: np.ndarray, accel: np.ndarray, dt: float) -> None:
@@ -723,6 +817,18 @@ class EskfNode(Node):
         odom.twist.twist.linear.x = self._v[0]
         odom.twist.twist.linear.y = self._v[1]
         odom.twist.twist.linear.z = self._v[2]
+
+        # Fill twist covariance from error-state covariance P:
+        #   linear velocity  → P[3:6, 3:6]
+        #   angular velocity → P[12:15, 12:15] (gyro bias as proxy)
+        tcov = [0.0] * 36
+        tcov[0]  = self._P[3, 3]    # vx
+        tcov[7]  = self._P[4, 4]    # vy
+        tcov[14] = self._P[5, 5]    # vz
+        tcov[21] = self._P[12, 12]  # wx
+        tcov[28] = self._P[13, 13]  # wy
+        tcov[35] = self._P[14, 14]  # wz
+        odom.twist.covariance = tcov
 
         self._pub_odom.publish(odom)
 

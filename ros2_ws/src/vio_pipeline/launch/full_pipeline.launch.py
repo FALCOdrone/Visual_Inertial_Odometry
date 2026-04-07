@@ -39,11 +39,13 @@ def _make_nodes(context, *args, **kwargs):
     gps_mode      = LaunchConfiguration("gps_mode").perform(context).lower()
     use_rectifier = LaunchConfiguration("use_rectifier").perform(context)
     use_fgo       = LaunchConfiguration("use_fgo").perform(context)
+    use_lc        = LaunchConfiguration("use_loop_closure").perform(context)
     use_sim_time_bool  = use_sim_time.lower()  in ("true", "1", "yes")
     use_tf_bool        = use_tf.lower()        in ("true", "1", "yes")
     use_gps_bool       = use_gps.lower()       in ("true", "1", "yes")
     use_rectifier_bool = use_rectifier.lower() in ("true", "1", "yes")
     use_fgo_bool       = use_fgo.lower()       in ("true", "1", "yes")
+    use_lc_bool        = use_lc.lower()        in ("true", "1", "yes")
 
     # Load GPS profiles from YAML
     pkg_share = get_package_share_directory("vio_pipeline")
@@ -71,6 +73,7 @@ def _make_nodes(context, *args, **kwargs):
     ft_p   = pp["feature_tracking"]
     vio_p  = pp["vio"]
     fgo_p  = pp.get("fgo", {})
+    lc_p   = pp.get("loop_closure", {})
 
     output_dir = os.path.normpath(
         os.path.join(
@@ -161,10 +164,11 @@ def _make_nodes(context, *args, **kwargs):
                     "init_ba_std":  float(eskf_p["init_ba_std"]),
                     "init_bg_std":  float(eskf_p["init_bg_std"]),
                     "max_dt":       float(eskf_p["max_dt"]),
-                    "use_gps":       False,
-                    "gps_pos_std_h": gps_eskf["pos_std_h"],
-                    "gps_pos_std_v": gps_eskf["pos_std_v"],
-                    "gps_gate_chi2": gps_eskf["gate_chi2"],
+                    "use_gps":           False,
+                    "gps_pos_std_h":     gps_eskf["pos_std_h"],
+                    "gps_pos_std_v":     gps_eskf["pos_std_v"],
+                    "gps_gate_chi2":     gps_eskf["gate_chi2"],
+                    "use_loop_closure":  use_lc_bool,
                 }
             ],
         )] if not use_fgo_bool else []),
@@ -190,6 +194,9 @@ def _make_nodes(context, *args, **kwargs):
                     "prior_att_std":  float(fgo_p.get("prior_att_std", 0.01)),
                     "prior_ba_std":   float(fgo_p.get("prior_ba_std", 0.02)),
                     "prior_bg_std":   float(fgo_p.get("prior_bg_std", 5e-4)),
+                    "preint_min_rot_std": float(fgo_p.get("preint_min_rot_std", 0.05)),
+                    "preint_min_vel_std": float(fgo_p.get("preint_min_vel_std", 0.2)),
+                    "preint_min_pos_std": float(fgo_p.get("preint_min_pos_std", 0.05)),
                 }
             ],
         )] if use_fgo_bool else []),
@@ -247,6 +254,32 @@ def _make_nodes(context, *args, **kwargs):
                 }
             ],
         )] if use_gps_bool else []),
+        # Loop Closure Node (use_loop_closure:=true to enable)
+        *([Node(
+            package="vio_pipeline",
+            executable="loop_closure_node",
+            name="loop_closure_node",
+            output="screen",
+            parameters=[
+                {
+                    "use_sim_time":              use_sim_time_bool,
+                    "config_path":               config_file,
+                    "min_keyframe_separation":   int(lc_p.get("min_keyframe_separation", 20)),
+                    "min_loop_score":            float(lc_p.get("min_loop_score", 0.015)),
+                    "min_lc_inliers":            int(lc_p.get("min_lc_inliers", 20)),
+                    "max_lc_correction_m":       float(lc_p.get("max_lc_correction_m", 5.0)),
+                    "lc_pos_std":                float(lc_p.get("lc_pos_std", 0.3)),
+                    "lc_ang_std":                float(lc_p.get("lc_ang_std", 0.05)),
+                    "vocab_size":                int(lc_p.get("vocab_size", 256)),
+                    "vocab_min_keyframes":       int(lc_p.get("vocab_min_keyframes", 20)),
+                    "orb_n_features":            int(lc_p.get("orb_n_features", 500)),
+                    "pgo_max_iter":              int(lc_p.get("pgo_max_iter", 5)),
+                    "kf_translation_thresh":     float(lc_p.get("kf_translation_thresh", 0.05)),
+                    "kf_rotation_thresh_deg":    float(lc_p.get("kf_rotation_thresh_deg", 3.0)),
+                    "kf_max_age_sec":            float(lc_p.get("kf_max_age_sec", 0.5)),
+                }
+            ],
+        )] if use_lc_bool else []),
         # Debug Logger
         Node(
             package="vio_pipeline",
@@ -316,6 +349,17 @@ def generate_launch_description():
                 "use_fgo",
                 default_value="false",
                 description="Use FGO sliding-window backend instead of ESKF",
+            ),
+            DeclareLaunchArgument(
+                "use_loop_closure",
+                default_value="false",
+                description=(
+                    "Launch loop_closure_node alongside ESKF. "
+                    "Subscribes to /eskf/odometry + /cam0/image_rect, "
+                    "publishes corrected poses on /lc/corrected_odometry and "
+                    "trajectory on /lc/global_trajectory. "
+                    "Sends SE(3) corrections to ESKF via /lc/correction."
+                ),
             ),
             DeclareLaunchArgument(
                 "gps_mode",
